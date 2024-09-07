@@ -17,10 +17,10 @@
 #include <algorithm>
 #include <atomic>
 
+#include "absl/log/check.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 
-#include <grpc/support/log.h>
 #include <grpc/support/port_platform.h>
 
 namespace grpc_core {
@@ -28,7 +28,7 @@ namespace grpc_core {
 std::atomic<EventLog*> EventLog::g_instance_{nullptr};
 
 EventLog::~EventLog() {
-  GPR_ASSERT(g_instance_.load(std::memory_order_acquire) != this);
+  CHECK(g_instance_.load(std::memory_order_acquire) != this);
 }
 
 void EventLog::BeginCollection() {

@@ -20,11 +20,11 @@
 #include <limits>
 #include <utility>
 
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 
 #include <grpc/slice.h>
-#include <grpc/support/log.h>
 #include <grpc/support/port_platform.h>
 
 #include "src/core/ext/transport/chaotic_good/frame_header.h"
@@ -152,8 +152,8 @@ absl::StatusOr<Arena::PoolPtr<Metadata>> ReadMetadata(
     Arena* arena) {
   if (!maybe_slices.ok()) return maybe_slices.status();
   auto& slices = *maybe_slices;
-  GPR_ASSERT(arena != nullptr);
-  Arena::PoolPtr<Metadata> metadata = Arena::MakePooled<Metadata>();
+  CHECK_NE(arena, nullptr);
+  Arena::PoolPtr<Metadata> metadata = Arena::MakePooledForOverwrite<Metadata>();
   parser->BeginFrame(
       metadata.get(), std::numeric_limits<uint32_t>::max(),
       std::numeric_limits<uint32_t>::max(),
@@ -217,10 +217,12 @@ absl::Status SettingsFrame::Deserialize(HPackParser* parser,
   return deserializer.Finish();
 }
 
-BufferPair SettingsFrame::Serialize(HPackCompressor* encoder) const {
+BufferPair SettingsFrame::Serialize(HPackCompressor* encoder,
+                                    bool& saw_encoding_errors) const {
   FrameSerializer serializer(FrameType::kSettings, 0);
   if (headers.get() != nullptr) {
-    encoder->EncodeRawHeaders(*headers.get(), serializer.AddHeaders());
+    saw_encoding_errors |=
+        !encoder->EncodeRawHeaders(*headers.get(), serializer.AddHeaders());
   }
   return serializer.Finish();
 }
@@ -274,11 +276,13 @@ absl::Status ClientFragmentFrame::Deserialize(HPackParser* parser,
   return deserializer.Finish();
 }
 
-BufferPair ClientFragmentFrame::Serialize(HPackCompressor* encoder) const {
-  GPR_ASSERT(stream_id != 0);
+BufferPair ClientFragmentFrame::Serialize(HPackCompressor* encoder,
+                                          bool& saw_encoding_errors) const {
+  CHECK_NE(stream_id, 0u);
   FrameSerializer serializer(FrameType::kFragment, stream_id);
   if (headers.get() != nullptr) {
-    encoder->EncodeRawHeaders(*headers.get(), serializer.AddHeaders());
+    saw_encoding_errors |=
+        !encoder->EncodeRawHeaders(*headers.get(), serializer.AddHeaders());
   }
   if (message.has_value()) {
     serializer.AddMessage(message.value());
@@ -353,17 +357,20 @@ absl::Status ServerFragmentFrame::Deserialize(HPackParser* parser,
   return deserializer.Finish();
 }
 
-BufferPair ServerFragmentFrame::Serialize(HPackCompressor* encoder) const {
-  GPR_ASSERT(stream_id != 0);
+BufferPair ServerFragmentFrame::Serialize(HPackCompressor* encoder,
+                                          bool& saw_encoding_errors) const {
+  CHECK_NE(stream_id, 0u);
   FrameSerializer serializer(FrameType::kFragment, stream_id);
   if (headers.get() != nullptr) {
-    encoder->EncodeRawHeaders(*headers.get(), serializer.AddHeaders());
+    saw_encoding_errors |=
+        !encoder->EncodeRawHeaders(*headers.get(), serializer.AddHeaders());
   }
   if (message.has_value()) {
     serializer.AddMessage(message.value());
   }
   if (trailers.get() != nullptr) {
-    encoder->EncodeRawHeaders(*trailers.get(), serializer.AddTrailers());
+    saw_encoding_errors |=
+        !encoder->EncodeRawHeaders(*trailers.get(), serializer.AddTrailers());
   }
   return serializer.Finish();
 }
@@ -398,8 +405,8 @@ absl::Status CancelFrame::Deserialize(HPackParser*, const FrameHeader& header,
   return deserializer.Finish();
 }
 
-BufferPair CancelFrame::Serialize(HPackCompressor*) const {
-  GPR_ASSERT(stream_id != 0);
+BufferPair CancelFrame::Serialize(HPackCompressor*, bool&) const {
+  CHECK_NE(stream_id, 0u);
   FrameSerializer serializer(FrameType::kCancel, stream_id);
   return serializer.Finish();
 }

@@ -28,6 +28,7 @@
 #include "absl/container/inlined_vector.h"
 #include "absl/status/statusor.h"
 
+#include <grpc/credentials.h>
 #include <grpc/grpc.h>
 #include <grpc/grpc_security.h>
 #include <grpc/grpc_security_constants.h>
@@ -35,7 +36,6 @@
 #include <grpc/support/port_platform.h>
 
 #include "src/core/lib/debug/trace.h"
-#include "src/core/lib/gpr/useful.h"
 #include "src/core/lib/gprpp/ref_counted.h"
 #include "src/core/lib/gprpp/ref_counted_ptr.h"
 #include "src/core/lib/gprpp/unique_type_name.h"
@@ -46,8 +46,7 @@
 #include "src/core/lib/security/credentials/credentials.h"
 #include "src/core/lib/slice/slice.h"
 #include "src/core/lib/transport/transport.h"
-
-extern grpc_core::TraceFlag grpc_plugin_credentials_trace;
+#include "src/core/util/useful.h"
 
 // This type is forward declared as a C struct and we cannot define it as a
 // class. Otherwise, compiler will complain about type mismatch due to
@@ -57,6 +56,8 @@ struct grpc_plugin_credentials final : public grpc_call_credentials {
   explicit grpc_plugin_credentials(grpc_metadata_credentials_plugin plugin,
                                    grpc_security_level min_security_level);
   ~grpc_plugin_credentials() override;
+
+  void Orphaned() override {}
 
   grpc_core::ArenaPromise<absl::StatusOr<grpc_core::ClientMetadataHandle>>
   GetRequestMetadata(grpc_core::ClientMetadataHandle initial_metadata,

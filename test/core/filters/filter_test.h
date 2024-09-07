@@ -101,19 +101,12 @@ class FilterTestBase : public ::testing::Test {
     struct Impl {
       Impl(std::unique_ptr<ChannelFilter> filter, FilterTestBase* test)
           : filter(std::move(filter)), test(test) {}
-      size_t initial_arena_size = 1024;
-      MemoryAllocator memory_allocator =
-          ResourceQuota::Default()->memory_quota()->CreateMemoryAllocator(
-              "test");
+      RefCountedPtr<ArenaFactory> arena_factory = SimpleArenaAllocator();
       std::unique_ptr<ChannelFilter> filter;
       FilterTestBase* const test;
     };
 
    public:
-    void set_initial_arena_size(size_t size) {
-      impl_->initial_arena_size = size;
-    }
-
     Call MakeCall();
 
    protected:
@@ -170,7 +163,7 @@ class FilterTestBase : public ::testing::Test {
     // metadata.
     void FinishNextFilter(ServerMetadataHandle md);
 
-    Arena* arena();
+    Arena* arena() const;
 
    private:
     friend class Channel;
@@ -229,9 +222,9 @@ class FilterTest : public FilterTestBase {
   };
 
   absl::StatusOr<Channel> MakeChannel(const ChannelArgs& args) {
-    auto filter = Filter::Create(args, ChannelFilter::Args());
+    auto filter = Filter::Create(args, ChannelFilter::Args(/*instance_id=*/0));
     if (!filter.ok()) return filter.status();
-    return Channel(std::make_unique<Filter>(std::move(*filter)), this);
+    return Channel(std::move(*filter), this);
   }
 };
 

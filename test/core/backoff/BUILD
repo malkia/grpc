@@ -32,10 +32,9 @@ grpc_cc_test(
     uses_polling = False,
     deps = [
         "//:backoff",
-        "//:exec_ctx",
         "//:grpc",
         "//src/core:time",
-        "//test/core/util:grpc_test_util",
+        "//test/core/test_util:grpc_test_util",
     ],
 )
 

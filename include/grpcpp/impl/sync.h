@@ -27,9 +27,9 @@
 
 #include <mutex>
 
+#include "absl/log/absl_check.h"
 #include "absl/synchronization/mutex.h"
 
-#include <grpc/support/log.h>
 #include <grpc/support/sync.h>
 #include <grpc/support/time.h>
 
@@ -105,7 +105,7 @@ class ABSL_SCOPED_LOCKABLE ReleasableMutexLock {
   ReleasableMutexLock& operator=(const ReleasableMutexLock&) = delete;
 
   void Release() ABSL_UNLOCK_FUNCTION() {
-    GPR_DEBUG_ASSERT(!released_);
+    ABSL_DCHECK(!released_);
     released_ = true;
     mu_->Unlock();
   }

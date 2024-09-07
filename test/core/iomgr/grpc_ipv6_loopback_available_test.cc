@@ -19,11 +19,10 @@
 #include <gtest/gtest.h>
 
 #include <grpc/grpc.h>
-#include <grpc/support/log.h>
 
 #include "src/core/lib/gprpp/crash.h"
 #include "src/core/lib/iomgr/port.h"
-#include "test/core/util/test_config.h"
+#include "test/core/test_util/test_config.h"
 
 #ifdef GPR_WINDOWS
 #include "src/core/lib/iomgr/socket_windows.h"

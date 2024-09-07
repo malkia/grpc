@@ -33,6 +33,7 @@
 
 #include "absl/functional/bind_front.h"
 #include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/memory/memory.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
@@ -45,7 +46,6 @@
 #include <grpc/grpc.h>
 #include <grpc/grpc_security.h>
 #include <grpc/support/alloc.h>
-#include <grpc/support/log.h>
 #include <grpc/support/time.h>
 #include <grpcpp/channel.h>
 #include <grpcpp/client_context.h>
@@ -58,18 +58,11 @@
 
 #include "src/core/client_channel/backup_poller.h"
 #include "src/core/ext/filters/http/client/http_client_filter.h"
-#include "src/core/ext/xds/xds_api.h"
-#include "src/core/ext/xds/xds_channel_args.h"
-#include "src/core/ext/xds/xds_client.h"
-#include "src/core/ext/xds/xds_listener.h"
 #include "src/core/lib/address_utils/parse_address.h"
 #include "src/core/lib/address_utils/sockaddr_utils.h"
 #include "src/core/lib/channel/channel_args.h"
 #include "src/core/lib/config/config_vars.h"
 #include "src/core/lib/config/core_configuration.h"
-#include "src/core/lib/gpr/string.h"
-#include "src/core/lib/gpr/time_precise.h"
-#include "src/core/lib/gpr/tmpfile.h"
 #include "src/core/lib/gprpp/crash.h"
 #include "src/core/lib/gprpp/env.h"
 #include "src/core/lib/gprpp/ref_counted_ptr.h"
@@ -84,6 +77,13 @@
 #include "src/core/load_balancing/xds/xds_channel_args.h"
 #include "src/core/resolver/endpoint_addresses.h"
 #include "src/core/resolver/fake/fake_resolver.h"
+#include "src/core/util/string.h"
+#include "src/core/util/time_precise.h"
+#include "src/core/util/tmpfile.h"
+#include "src/core/xds/grpc/xds_listener.h"
+#include "src/core/xds/xds_client/xds_api.h"
+#include "src/core/xds/xds_client/xds_channel_args.h"
+#include "src/core/xds/xds_client/xds_client.h"
 #include "src/cpp/client/secure_credentials.h"
 #include "src/cpp/server/secure_server_credentials.h"
 #include "src/proto/grpc/testing/echo.grpc.pb.h"
@@ -102,12 +102,12 @@
 #include "src/proto/grpc/testing/xds/v3/router.grpc.pb.h"
 #include "src/proto/grpc/testing/xds/v3/tls.grpc.pb.h"
 #include "src/proto/grpc/testing/xds/v3/typed_struct.pb.h"
-#include "test/core/util/audit_logging_utils.h"
-#include "test/core/util/port.h"
-#include "test/core/util/resolve_localhost_ip46.h"
-#include "test/core/util/scoped_env_var.h"
-#include "test/core/util/test_config.h"
-#include "test/core/util/tls_utils.h"
+#include "test/core/test_util/audit_logging_utils.h"
+#include "test/core/test_util/port.h"
+#include "test/core/test_util/resolve_localhost_ip46.h"
+#include "test/core/test_util/scoped_env_var.h"
+#include "test/core/test_util/test_config.h"
+#include "test/core/test_util/tls_utils.h"
 #include "test/cpp/end2end/xds/xds_end2end_test_lib.h"
 #include "test/cpp/util/test_config.h"
 #include "test/cpp/util/tls_test_utils.h"
@@ -292,8 +292,12 @@ class XdsSecurityTest : public XdsEnd2endTest {
                                      kCaCertPath));
     builder.AddCertificateProviderPlugin("file_plugin", "file_watcher",
                                          absl::StrJoin(fields, ",\n"));
-    InitClient(builder);
-    CreateAndStartBackends(2);
+    InitClient(builder, /*lb_expected_authority=*/"",
+               /*xds_resource_does_not_exist_timeout_ms=*/0,
+               /*balancer_authority_override=*/"", /*args=*/nullptr,
+               CreateXdsChannelCredentials());
+    CreateAndStartBackends(2, /*xds_enabled=*/false,
+                           CreateMtlsServerCredentials());
     root_cert_ = grpc_core::testing::GetFileContents(kCaCertPath);
     bad_root_cert_ = grpc_core::testing::GetFileContents(kBadClientCertPath);
     identity_pair_ = ReadTlsIdentityPair(kClientKeyPath, kClientCertPath);
@@ -398,8 +402,7 @@ class XdsSecurityTest : public XdsEnd2endTest {
           DEBUG_LOCATION,
           [&](const RpcResult& result) {
             if (result.status.ok()) {
-              gpr_log(GPR_ERROR,
-                      "RPC succeeded. Failure expected. Trying again.");
+              LOG(ERROR) << "RPC succeeded. Failure expected. Trying again.";
               return true;
             }
             EXPECT_EQ(result.status.error_code(), StatusCode::UNAVAILABLE);
@@ -480,6 +483,24 @@ TEST_P(XdsSecurityTest,
       ->mutable_combined_validation_context()
       ->mutable_validation_context_certificate_provider_instance()
       ->set_instance_name("fake_plugin1");
+  transport_socket->mutable_typed_config()->PackFrom(upstream_tls_context);
+  balancer_->ads_service()->SetCdsResource(cluster);
+  CheckRpcSendOk(DEBUG_LOCATION, 1, RpcOptions().set_timeout_ms(5000));
+}
+
+TEST_P(XdsSecurityTest, UseSystemRootCerts) {
+  grpc_core::testing::ScopedExperimentalEnvVar env1(
+      "GRPC_EXPERIMENTAL_XDS_SYSTEM_ROOT_CERTS");
+  grpc_core::testing::ScopedEnvVar env2("GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
+                                        kCaCertPath);
+  g_fake1_cert_data_map->Set({{"", {root_cert_, identity_pair_}}});
+  auto cluster = default_cluster_;
+  auto* transport_socket = cluster.mutable_transport_socket();
+  transport_socket->set_name("envoy.transport_sockets.tls");
+  UpstreamTlsContext upstream_tls_context;
+  upstream_tls_context.mutable_common_tls_context()
+      ->mutable_validation_context()
+      ->mutable_system_root_certs();
   transport_socket->mutable_typed_config()->PackFrom(upstream_tls_context);
   balancer_->ads_service()->SetCdsResource(cluster);
   CheckRpcSendOk(DEBUG_LOCATION, 1, RpcOptions().set_timeout_ms(5000));
@@ -812,12 +833,16 @@ class XdsEnabledServerTest : public XdsEnd2endTest {
 TEST_P(XdsEnabledServerTest, Basic) {
   DoSetUp();
   backends_[0]->Start();
+  backends_[0]->notifier()->WaitOnServingStatusChange(
+      grpc_core::LocalIpAndPort(backends_[0]->port()), grpc::StatusCode::OK);
   WaitForBackend(DEBUG_LOCATION, 0);
 }
 
 TEST_P(XdsEnabledServerTest, ListenerDeletionIgnored) {
   DoSetUp(MakeBootstrapBuilder().SetIgnoreResourceDeletion());
   backends_[0]->Start();
+  backends_[0]->notifier()->WaitOnServingStatusChange(
+      grpc_core::LocalIpAndPort(backends_[0]->port()), grpc::StatusCode::OK);
   WaitForBackend(DEBUG_LOCATION, 0);
   // Check that we ACKed.
   // TODO(roth): There may be multiple entries in the resource state response
@@ -922,8 +947,12 @@ class XdsServerSecurityTest : public XdsEnd2endTest {
                                      kCaCertPath));
     builder.AddCertificateProviderPlugin("file_plugin", "file_watcher",
                                          absl::StrJoin(fields, ",\n"));
-    InitClient(builder);
-    CreateBackends(1, /*xds_enabled=*/true);
+    InitClient(builder, /*lb_expected_authority=*/"",
+               /*xds_resource_does_not_exist_timeout_ms=*/0,
+               /*balancer_authority_override=*/"", /*args=*/nullptr,
+               CreateXdsChannelCredentials());
+    CreateBackends(1, /*xds_enabled=*/true,
+                   XdsServerCredentials(InsecureServerCredentials()));
     root_cert_ = grpc_core::testing::GetFileContents(kCaCertPath);
     bad_root_cert_ = grpc_core::testing::GetFileContents(kBadClientCertPath);
     identity_pair_ = ReadTlsIdentityPair(kServerKeyPath, kServerCertPath);
@@ -1051,7 +1080,7 @@ class XdsServerSecurityTest : public XdsEnd2endTest {
       std::vector<std::string> expected_client_identity,
       bool test_expects_failure = false,
       absl::optional<grpc::StatusCode> expected_status = absl::nullopt) {
-    gpr_log(GPR_INFO, "Sending RPC");
+    LOG(INFO) << "Sending RPC";
     int num_tries = 0;
     constexpr int kRetryCount = 100;
     auto overall_deadline = absl::Now() + absl::Seconds(5);
@@ -1073,20 +1102,21 @@ class XdsServerSecurityTest : public XdsEnd2endTest {
       Status status = stub->Echo(&context, request, &response);
       if (test_expects_failure) {
         if (status.ok()) {
-          gpr_log(GPR_ERROR, "RPC succeeded. Failure expected. Trying again.");
+          LOG(ERROR) << "RPC succeeded. Failure expected. Trying again.";
           continue;
         }
         if (expected_status.has_value() &&
             *expected_status != status.error_code()) {
-          gpr_log(GPR_ERROR,
-                  "Expected status does not match Actual(%d) vs Expected(%d)",
-                  status.error_code(), *expected_status);
+          LOG(ERROR) << "Expected status does not match Actual("
+                     << status.error_code() << ") vs Expected("
+                     << *expected_status << ")";
           continue;
         }
       } else {
         if (!status.ok()) {
-          gpr_log(GPR_ERROR, "RPC failed. code=%d message=%s Trying again.",
-                  status.error_code(), status.error_message().c_str());
+          LOG(ERROR) << "RPC failed. code=" << status.error_code()
+                     << " message=" << status.error_message()
+                     << " Trying again.";
           continue;
         }
         EXPECT_EQ(response.message(), kRequestMessage);
@@ -1096,23 +1126,21 @@ class XdsServerSecurityTest : public XdsEnd2endTest {
               std::string(entry.data(), entry.size()).c_str());
         }
         if (peer_identity != expected_server_identity) {
-          gpr_log(GPR_ERROR,
-                  "Expected server identity does not match. (actual) %s vs "
-                  "(expected) %s Trying again.",
-                  absl::StrJoin(peer_identity, ",").c_str(),
-                  absl::StrJoin(expected_server_identity, ",").c_str());
+          LOG(ERROR) << "Expected server identity does not match. (actual) "
+                     << absl::StrJoin(peer_identity, ",") << " vs (expected) "
+                     << absl::StrJoin(expected_server_identity, ",")
+                     << " Trying again.";
           continue;
         }
         if (backends_[0]->backend_service()->last_peer_identity() !=
             expected_client_identity) {
-          gpr_log(
-              GPR_ERROR,
-              "Expected client identity does not match. (actual) %s vs "
-              "(expected) %s Trying again.",
-              absl::StrJoin(
-                  backends_[0]->backend_service()->last_peer_identity(), ",")
-                  .c_str(),
-              absl::StrJoin(expected_client_identity, ",").c_str());
+          LOG(ERROR)
+              << "Expected client identity does not match. (actual) "
+              << absl::StrJoin(
+                     backends_[0]->backend_service()->last_peer_identity(), ",")
+              << " vs (expected) "
+              << absl::StrJoin(expected_client_identity, ",")
+              << " Trying again.";
           continue;
         }
       }
@@ -3108,14 +3136,8 @@ TEST_P(XdsRbacTestWithActionAndAuditConditionPermutations, MultipleLoggers) {
   }
 }
 
-// CDS depends on XdsResolver.
-// Security depends on v3.
-// Not enabling load reporting or RDS, since those are irrelevant to these
-// tests.
-INSTANTIATE_TEST_SUITE_P(
-    XdsTest, XdsSecurityTest,
-    ::testing::Values(XdsTestType().set_use_xds_credentials()),
-    &XdsTestType::Name);
+INSTANTIATE_TEST_SUITE_P(XdsTest, XdsSecurityTest,
+                         ::testing::Values(XdsTestType()), &XdsTestType::Name);
 
 // We are only testing the server here.
 // Run with bootstrap from env var, so that we use a global XdsClient
@@ -3128,39 +3150,28 @@ INSTANTIATE_TEST_SUITE_P(XdsTest, XdsEnabledServerTest,
 
 // We are only testing the server here.
 // Run with bootstrap from env var so that we use one XdsClient.
-INSTANTIATE_TEST_SUITE_P(
-    XdsTest, XdsServerSecurityTest,
-    ::testing::Values(
-        XdsTestType()
-            .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar)
-            .set_use_xds_credentials()),
-    &XdsTestType::Name);
+INSTANTIATE_TEST_SUITE_P(XdsTest, XdsServerSecurityTest,
+                         ::testing::Values(XdsTestType().set_bootstrap_source(
+                             XdsTestType::kBootstrapFromEnvVar)),
+                         &XdsTestType::Name);
 
-INSTANTIATE_TEST_SUITE_P(
-    XdsTest, XdsEnabledServerStatusNotificationTest,
-    ::testing::Values(XdsTestType().set_use_xds_credentials()),
-    &XdsTestType::Name);
+INSTANTIATE_TEST_SUITE_P(XdsTest, XdsEnabledServerStatusNotificationTest,
+                         ::testing::Values(XdsTestType()), &XdsTestType::Name);
 
 // Run with bootstrap from env var so that we use one XdsClient.
-INSTANTIATE_TEST_SUITE_P(
-    XdsTest, XdsServerFilterChainMatchTest,
-    ::testing::Values(
-        XdsTestType()
-            .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar)
-            .set_use_xds_credentials()),
-    &XdsTestType::Name);
+INSTANTIATE_TEST_SUITE_P(XdsTest, XdsServerFilterChainMatchTest,
+                         ::testing::Values(XdsTestType().set_bootstrap_source(
+                             XdsTestType::kBootstrapFromEnvVar)),
+                         &XdsTestType::Name);
 
 // Test xDS-enabled server with and without RDS.
 // Run with bootstrap from env var so that we use one XdsClient.
 INSTANTIATE_TEST_SUITE_P(
     XdsTest, XdsServerRdsTest,
     ::testing::Values(
+        XdsTestType().set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar)
-            .set_use_xds_credentials(),
-        XdsTestType()
-            .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar)
-            .set_use_xds_credentials()
             .set_enable_rds_testing()),
     &XdsTestType::Name);
 
@@ -3171,19 +3182,14 @@ INSTANTIATE_TEST_SUITE_P(
 INSTANTIATE_TEST_SUITE_P(
     XdsTest, XdsRbacTest,
     ::testing::Values(
-        XdsTestType().set_use_xds_credentials().set_bootstrap_source(
+        XdsTestType().set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
+        XdsTestType().set_enable_rds_testing().set_bootstrap_source(
             XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
-            .set_enable_rds_testing()
-            .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
-        XdsTestType()
-            .set_use_xds_credentials()
             .set_filter_config_setup(
                 XdsTestType::HttpFilterConfigLocation::kHttpFilterConfigInRoute)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_enable_rds_testing()
             .set_filter_config_setup(
                 XdsTestType::HttpFilterConfigLocation::kHttpFilterConfigInRoute)
@@ -3198,12 +3204,10 @@ INSTANTIATE_TEST_SUITE_P(
     XdsTest, XdsRbacTestWithRouteOverrideAlwaysPresent,
     ::testing::Values(
         XdsTestType()
-            .set_use_xds_credentials()
             .set_filter_config_setup(
                 XdsTestType::HttpFilterConfigLocation::kHttpFilterConfigInRoute)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_enable_rds_testing()
             .set_filter_config_setup(
                 XdsTestType::HttpFilterConfigLocation::kHttpFilterConfigInRoute)
@@ -3218,44 +3222,36 @@ INSTANTIATE_TEST_SUITE_P(
     XdsTest, XdsRbacTestWithActionPermutations,
     ::testing::Values(
         XdsTestType()
-            .set_use_xds_credentials()
             .set_rbac_action(RBAC_Action_ALLOW)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_rbac_action(RBAC_Action_DENY)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_enable_rds_testing()
             .set_rbac_action(RBAC_Action_ALLOW)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_enable_rds_testing()
             .set_rbac_action(RBAC_Action_DENY)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_filter_config_setup(
                 XdsTestType::HttpFilterConfigLocation::kHttpFilterConfigInRoute)
             .set_rbac_action(RBAC_Action_ALLOW)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_filter_config_setup(
                 XdsTestType::HttpFilterConfigLocation::kHttpFilterConfigInRoute)
             .set_rbac_action(RBAC_Action_DENY)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_enable_rds_testing()
             .set_filter_config_setup(
                 XdsTestType::HttpFilterConfigLocation::kHttpFilterConfigInRoute)
             .set_rbac_action(RBAC_Action_ALLOW)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_enable_rds_testing()
             .set_filter_config_setup(
                 XdsTestType::HttpFilterConfigLocation::kHttpFilterConfigInRoute)
@@ -3267,37 +3263,31 @@ INSTANTIATE_TEST_SUITE_P(
     XdsTest, XdsRbacTestWithActionAndAuditConditionPermutations,
     ::testing::Values(
         XdsTestType()
-            .set_use_xds_credentials()
             .set_rbac_action(RBAC_Action_ALLOW)
             .set_rbac_audit_condition(
                 RBAC_AuditLoggingOptions_AuditCondition_ON_DENY)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_rbac_action(RBAC_Action_ALLOW)
             .set_rbac_audit_condition(
                 RBAC_AuditLoggingOptions_AuditCondition_ON_ALLOW)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_rbac_action(RBAC_Action_ALLOW)
             .set_rbac_audit_condition(
                 RBAC_AuditLoggingOptions_AuditCondition_ON_DENY_AND_ALLOW)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_rbac_action(RBAC_Action_DENY)
             .set_rbac_audit_condition(
                 RBAC_AuditLoggingOptions_AuditCondition_ON_ALLOW)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_rbac_action(RBAC_Action_DENY)
             .set_rbac_audit_condition(
                 RBAC_AuditLoggingOptions_AuditCondition_ON_DENY)
             .set_bootstrap_source(XdsTestType::kBootstrapFromEnvVar),
         XdsTestType()
-            .set_use_xds_credentials()
             .set_enable_rds_testing()
             .set_rbac_action(RBAC_Action_DENY)
             .set_rbac_audit_condition(

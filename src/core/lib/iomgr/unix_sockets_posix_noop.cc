@@ -24,7 +24,7 @@
 
 #include <string>
 
-#include <grpc/support/log.h>
+#include "absl/log/check.h"
 
 #include "src/core/lib/gprpp/crash.h"
 
@@ -32,7 +32,7 @@ void grpc_create_socketpair_if_unix(int /* sv */[2]) {
   // TODO: Either implement this for the non-Unix socket case or make
   // sure that it is never called in any such case. Until then, leave an
   // assertion to notify if this gets called inadvertently
-  GPR_ASSERT(0);
+  CHECK(0);
 }
 
 absl::StatusOr<std::vector<grpc_resolved_address>>

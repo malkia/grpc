@@ -26,6 +26,7 @@
 #include <gtest/gtest.h>
 
 #include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
@@ -36,7 +37,6 @@
 #include <grpc/grpc.h>
 #include <grpc/support/alloc.h>
 #include <grpc/support/atm.h>
-#include <grpc/support/log.h>
 #include <grpc/support/time.h>
 #include <grpcpp/channel.h>
 #include <grpcpp/client_context.h>
@@ -65,20 +65,20 @@
 #include "src/core/lib/gprpp/time.h"
 #include "src/core/lib/iomgr/tcp_client.h"
 #include "src/core/lib/security/credentials/fake/fake_credentials.h"
-#include "src/core/lib/surface/server.h"
 #include "src/core/lib/transport/connectivity_state.h"
 #include "src/core/resolver/endpoint_addresses.h"
 #include "src/core/resolver/fake/fake_resolver.h"
+#include "src/core/server/server.h"
 #include "src/core/service_config/service_config.h"
 #include "src/core/service_config/service_config_impl.h"
 #include "src/cpp/server/secure_server_credentials.h"
 #include "src/proto/grpc/health/v1/health.grpc.pb.h"
 #include "src/proto/grpc/testing/echo.grpc.pb.h"
 #include "src/proto/grpc/testing/xds/v3/orca_load_report.pb.h"
-#include "test/core/util/port.h"
-#include "test/core/util/resolve_localhost_ip46.h"
-#include "test/core/util/test_config.h"
-#include "test/core/util/test_lb_policies.h"
+#include "test/core/test_util/port.h"
+#include "test/core/test_util/resolve_localhost_ip46.h"
+#include "test/core/test_util/test_config.h"
+#include "test/core/test_util/test_lb_policies.h"
 #include "test/cpp/end2end/connection_attempt_injector.h"
 #include "test/cpp/end2end/test_service_impl.h"
 #include "test/cpp/util/credentials.h"
@@ -239,7 +239,7 @@ class FakeResolverResponseGeneratorWrapper {
     for (const int& port : ports) {
       absl::StatusOr<grpc_core::URI> lb_uri =
           grpc_core::URI::Parse(grpc_core::LocalIpUri(port));
-      CHECK(lb_uri.ok());
+      CHECK_OK(lb_uri);
       grpc_resolved_address address;
       CHECK(grpc_parse_uri(*lb_uri, &address));
       result.addresses->emplace_back(address, per_address_args);
@@ -259,12 +259,10 @@ class FakeResolverResponseGeneratorWrapper {
       response_generator_;
 };
 
+constexpr absl::string_view kDefaultAuthority = "default.example.com";
+
 class ClientLbEnd2endTest : public ::testing::Test {
  protected:
-  ClientLbEnd2endTest()
-      : server_host_("localhost"),
-        creds_(std::make_shared<FakeTransportSecurityChannelCredentials>()) {}
-
   void SetUp() override { grpc_init(); }
 
   void TearDown() override {
@@ -272,25 +270,25 @@ class ClientLbEnd2endTest : public ::testing::Test {
       servers_[i]->Shutdown();
     }
     servers_.clear();
-    creds_.reset();
     grpc_shutdown();
   }
 
-  void CreateServers(size_t num_servers,
-                     std::vector<int> ports = std::vector<int>()) {
+  void CreateServers(
+      size_t num_servers, std::vector<int> ports = {},
+      std::shared_ptr<ServerCredentials> server_creds = nullptr) {
     servers_.clear();
     for (size_t i = 0; i < num_servers; ++i) {
       int port = 0;
       if (ports.size() == num_servers) port = ports[i];
-      servers_.emplace_back(new ServerData(port));
+      servers_.emplace_back(new ServerData(port, server_creds));
     }
   }
 
-  void StartServer(size_t index) { servers_[index]->Start(server_host_); }
+  void StartServer(size_t index) { servers_[index]->Start(); }
 
-  void StartServers(size_t num_servers,
-                    std::vector<int> ports = std::vector<int>()) {
-    CreateServers(num_servers, std::move(ports));
+  void StartServers(size_t num_servers, std::vector<int> ports = {},
+                    std::shared_ptr<ServerCredentials> server_creds = nullptr) {
+    CreateServers(num_servers, std::move(ports), std::move(server_creds));
     for (size_t i = 0; i < num_servers; ++i) {
       StartServer(i);
     }
@@ -314,19 +312,26 @@ class ClientLbEnd2endTest : public ::testing::Test {
   std::shared_ptr<Channel> BuildChannel(
       const std::string& lb_policy_name,
       const FakeResolverResponseGeneratorWrapper& response_generator,
-      ChannelArguments args = ChannelArguments()) {
+      ChannelArguments args = ChannelArguments(),
+      std::shared_ptr<ChannelCredentials> channel_creds = nullptr) {
     if (!lb_policy_name.empty()) {
       args.SetLoadBalancingPolicyName(lb_policy_name);
     }  // else, default to pick first
     args.SetPointer(GRPC_ARG_FAKE_RESOLVER_RESPONSE_GENERATOR,
                     response_generator.Get());
-    return grpc::CreateCustomChannel("fake:default.example.com", creds_, args);
+    if (channel_creds == nullptr) {
+      channel_creds =
+          std::make_shared<FakeTransportSecurityChannelCredentials>();
+    }
+    return grpc::CreateCustomChannel(absl::StrCat("fake:", kDefaultAuthority),
+                                     channel_creds, args);
   }
 
   Status SendRpc(
       const std::unique_ptr<grpc::testing::EchoTestService::Stub>& stub,
       EchoResponse* response = nullptr, int timeout_ms = 1000,
-      bool wait_for_ready = false, EchoRequest* request = nullptr) {
+      bool wait_for_ready = false, EchoRequest* request = nullptr,
+      std::string authority_override = "") {
     EchoResponse local_response;
     if (response == nullptr) response = &local_response;
     EchoRequest local_request;
@@ -335,6 +340,7 @@ class ClientLbEnd2endTest : public ::testing::Test {
     request->mutable_param()->set_echo_metadata(true);
     ClientContext context;
     context.set_deadline(grpc_timeout_milliseconds_to_deadline(timeout_ms));
+    if (!authority_override.empty()) context.set_authority(authority_override);
     if (wait_for_ready) context.set_wait_for_ready(true);
     context.AddMetadata("foo", "1");
     context.AddMetadata("bar", "2");
@@ -402,6 +408,7 @@ class ClientLbEnd2endTest : public ::testing::Test {
 
   struct ServerData {
     const int port_;
+    const std::shared_ptr<ServerCredentials> server_creds_;
     std::unique_ptr<Server> server_;
     MyTestServiceImpl service_;
     std::unique_ptr<experimental::ServerMetricRecorder> server_metric_recorder_;
@@ -415,34 +422,38 @@ class ClientLbEnd2endTest : public ::testing::Test {
     bool server_ready_ ABSL_GUARDED_BY(mu_) = false;
     bool started_ ABSL_GUARDED_BY(mu_) = false;
 
-    explicit ServerData(int port = 0)
+    explicit ServerData(
+        int port = 0, std::shared_ptr<ServerCredentials> server_creds = nullptr)
         : port_(port > 0 ? port : grpc_pick_unused_port_or_die()),
+          server_creds_(
+              server_creds == nullptr
+                  ? std::shared_ptr<
+                        ServerCredentials>(new SecureServerCredentials(
+                        grpc_fake_transport_security_server_credentials_create()))
+                  : std::move(server_creds)),
           server_metric_recorder_(experimental::ServerMetricRecorder::Create()),
           orca_service_(
               server_metric_recorder_.get(),
               experimental::OrcaService::Options().set_min_report_duration(
                   absl::Seconds(0.1))) {}
 
-    void Start(const std::string& server_host) {
-      gpr_log(GPR_INFO, "starting server on port %d", port_);
+    void Start() {
+      LOG(INFO) << "starting server on port " << port_;
       grpc_core::MutexLock lock(&mu_);
       started_ = true;
-      thread_ = std::make_unique<std::thread>(
-          std::bind(&ServerData::Serve, this, server_host));
+      thread_ =
+          std::make_unique<std::thread>(std::bind(&ServerData::Serve, this));
       while (!server_ready_) {
         cond_.Wait(&mu_);
       }
       server_ready_ = false;
-      gpr_log(GPR_INFO, "server startup complete");
+      LOG(INFO) << "server startup complete";
     }
 
-    void Serve(const std::string& server_host) {
-      std::ostringstream server_address;
-      server_address << server_host << ":" << port_;
+    void Serve() {
       ServerBuilder builder;
-      std::shared_ptr<ServerCredentials> creds(new SecureServerCredentials(
-          grpc_fake_transport_security_server_credentials_create()));
-      builder.AddListeningPort(server_address.str(), std::move(creds));
+      builder.AddListeningPort(absl::StrCat("localhost:", port_),
+                               server_creds_);
       builder.RegisterService(&service_);
       builder.RegisterService(&orca_service_);
       if (enable_noop_health_check_service_) {
@@ -498,10 +509,8 @@ class ClientLbEnd2endTest : public ::testing::Test {
       absl::Duration timeout = absl::Seconds(30)) {
     if (stop_index == 0) stop_index = servers_.size();
     auto deadline = absl::Now() + (timeout * grpc_test_slowdown_factor());
-    gpr_log(GPR_INFO,
-            "========= WAITING FOR BACKENDS [%" PRIuPTR ", %" PRIuPTR
-            ") ==========",
-            start_index, stop_index);
+    LOG(INFO) << "========= WAITING FOR BACKENDS [" << start_index << ", "
+              << stop_index << ") ==========";
     while (!SeenAllServers(start_index, stop_index)) {
       Status status = SendRpc(stub);
       if (status_check != nullptr) {
@@ -581,19 +590,26 @@ class ClientLbEnd2endTest : public ::testing::Test {
   }
 
   static std::string MakeConnectionFailureRegex(absl::string_view prefix) {
-    return absl::StrCat(prefix,
-                        "; last error: (UNKNOWN|UNAVAILABLE): "
-                        "(ipv6:%5B::1%5D|ipv4:127.0.0.1):[0-9]+: "
-                        "(Failed to connect to remote host: )?"
-                        "(Connection refused|Connection reset by peer|"
-                        "recvmsg:Connection reset by peer|"
-                        "getsockopt\\(SO\\_ERROR\\): Connection reset by peer|"
-                        "Socket closed|FD shutdown)");
+    return absl::StrCat(
+        prefix,
+        "; last error: (UNKNOWN|UNAVAILABLE): "
+        // IP address
+        "(ipv6:%5B::1%5D|ipv4:127.0.0.1):[0-9]+: "
+        // Prefixes added for context
+        "(Failed to connect to remote host: )?"
+        "(Timeout occurred: )?"
+        // Syscall
+        "((connect|sendmsg|recvmsg|getsockopt\\(SO\\_ERROR\\)): ?)?"
+        // strerror() output or other message
+        "(Connection refused"
+        "|Connection reset by peer"
+        "|Socket closed"
+        "|FD shutdown)"
+        // errno value
+        "( \\([0-9]+\\))?");
   }
 
-  const std::string server_host_;
   std::vector<std::unique_ptr<ServerData>> servers_;
-  std::shared_ptr<ChannelCredentials> creds_;
 };
 
 TEST_F(ClientLbEnd2endTest, ChannelStateConnectingWhenResolving) {
@@ -636,29 +652,47 @@ TEST_F(ClientLbEnd2endTest, ChannelIdleness) {
   // The initial channel state should be IDLE.
   EXPECT_EQ(channel->GetState(false), GRPC_CHANNEL_IDLE);
   // After sending RPC, channel state should be READY.
-  gpr_log(GPR_INFO, "*** SENDING RPC, CHANNEL SHOULD CONNECT ***");
+  LOG(INFO) << "*** SENDING RPC, CHANNEL SHOULD CONNECT ***";
   response_generator.SetNextResolution(GetServersPorts());
   CheckRpcSendOk(DEBUG_LOCATION, stub);
   EXPECT_EQ(channel->GetState(false), GRPC_CHANNEL_READY);
   // After a period time not using the channel, the channel state should switch
   // to IDLE.
-  gpr_log(GPR_INFO, "*** WAITING FOR CHANNEL TO GO IDLE ***");
+  LOG(INFO) << "*** WAITING FOR CHANNEL TO GO IDLE ***";
   gpr_sleep_until(grpc_timeout_milliseconds_to_deadline(1200));
   EXPECT_EQ(channel->GetState(false), GRPC_CHANNEL_IDLE);
   // Sending a new RPC should awake the IDLE channel.
-  gpr_log(GPR_INFO, "*** SENDING ANOTHER RPC, CHANNEL SHOULD RECONNECT ***");
+  LOG(INFO) << "*** SENDING ANOTHER RPC, CHANNEL SHOULD RECONNECT ***";
   response_generator.SetNextResolution(GetServersPorts());
   CheckRpcSendOk(DEBUG_LOCATION, stub);
   EXPECT_EQ(channel->GetState(false), GRPC_CHANNEL_READY);
 }
 
-TEST_F(ClientLbEnd2endTest, AuthorityOverrideOnChannel) {
+//
+// authority override tests
+//
+
+class AuthorityOverrideTest : public ClientLbEnd2endTest {
+ protected:
+  static void SetUpTestSuite() {
+    grpc_core::CoreConfiguration::Reset();
+    grpc_core::CoreConfiguration::RegisterBuilder(
+        [](grpc_core::CoreConfiguration::Builder* builder) {
+          grpc_core::RegisterAuthorityOverrideLoadBalancingPolicy(builder);
+        });
+    grpc_init();
+  }
+
+  static void TearDownTestSuite() {
+    grpc_shutdown();
+    grpc_core::CoreConfiguration::Reset();
+  }
+};
+
+TEST_F(AuthorityOverrideTest, NoOverride) {
   StartServers(1);
-  // Set authority via channel arg.
   FakeResolverResponseGeneratorWrapper response_generator;
-  ChannelArguments args;
-  args.SetString(GRPC_ARG_DEFAULT_AUTHORITY, "foo.example.com");
-  auto channel = BuildChannel("", response_generator, args);
+  auto channel = BuildChannel("", response_generator);
   auto stub = BuildStub(channel);
   response_generator.SetNextResolution(GetServersPorts());
   // Send an RPC.
@@ -670,10 +704,10 @@ TEST_F(ClientLbEnd2endTest, AuthorityOverrideOnChannel) {
   EXPECT_TRUE(status.ok()) << "code=" << status.error_code()
                            << " message=" << status.error_message();
   // Check that the right authority was seen by the server.
-  EXPECT_EQ("foo.example.com", response.param().host());
+  EXPECT_EQ(kDefaultAuthority, response.param().host());
 }
 
-TEST_F(ClientLbEnd2endTest, AuthorityOverrideFromResolver) {
+TEST_F(AuthorityOverrideTest, OverrideFromResolver) {
   StartServers(1);
   FakeResolverResponseGeneratorWrapper response_generator;
   auto channel = BuildChannel("", response_generator);
@@ -683,7 +717,7 @@ TEST_F(ClientLbEnd2endTest, AuthorityOverrideFromResolver) {
   response_generator.SetNextResolution(
       GetServersPorts(), /*service_config_json=*/nullptr,
       grpc_core::ChannelArgs().Set(GRPC_ARG_DEFAULT_AUTHORITY,
-                                   "foo.example.com"));
+                                   "from-resolver.example.com"));
   // Send an RPC.
   EchoRequest request;
   request.mutable_param()->set_echo_host_from_authority_header(true);
@@ -693,15 +727,82 @@ TEST_F(ClientLbEnd2endTest, AuthorityOverrideFromResolver) {
   EXPECT_TRUE(status.ok()) << "code=" << status.error_code()
                            << " message=" << status.error_message();
   // Check that the right authority was seen by the server.
-  EXPECT_EQ("foo.example.com", response.param().host());
+  EXPECT_EQ("from-resolver.example.com", response.param().host());
 }
 
-TEST_F(ClientLbEnd2endTest, AuthorityOverridePrecedence) {
+TEST_F(AuthorityOverrideTest, OverrideOnChannel) {
   StartServers(1);
   // Set authority via channel arg.
   FakeResolverResponseGeneratorWrapper response_generator;
   ChannelArguments args;
-  args.SetString(GRPC_ARG_DEFAULT_AUTHORITY, "foo.example.com");
+  args.SetString(GRPC_ARG_DEFAULT_AUTHORITY, "from-channel.example.com");
+  auto channel = BuildChannel("", response_generator, args);
+  auto stub = BuildStub(channel);
+  response_generator.SetNextResolution(GetServersPorts());
+  // Send an RPC.
+  EchoRequest request;
+  request.mutable_param()->set_echo_host_from_authority_header(true);
+  EchoResponse response;
+  Status status = SendRpc(stub, &response, /*timeout_ms=*/1000,
+                          /*wait_for_ready=*/false, &request);
+  EXPECT_TRUE(status.ok()) << "code=" << status.error_code()
+                           << " message=" << status.error_message();
+  // Check that the right authority was seen by the server.
+  EXPECT_EQ("from-channel.example.com", response.param().host());
+}
+
+TEST_F(AuthorityOverrideTest, OverrideFromLbPolicy) {
+  // We use InsecureCreds here to avoid the authority check in the fake
+  // security connector.
+  StartServers(1, {}, InsecureServerCredentials());
+  FakeResolverResponseGeneratorWrapper response_generator;
+  ChannelArguments args;
+  args.SetString(GRPC_ARG_TEST_LB_AUTHORITY_OVERRIDE, "from-lb.example.com");
+  auto channel = BuildChannel("authority_override_lb", response_generator, args,
+                              InsecureChannelCredentials());
+  auto stub = BuildStub(channel);
+  response_generator.SetNextResolution(GetServersPorts());
+  // Send an RPC.
+  EchoRequest request;
+  request.mutable_param()->set_echo_host_from_authority_header(true);
+  EchoResponse response;
+  Status status = SendRpc(stub, &response, /*timeout_ms=*/1000,
+                          /*wait_for_ready=*/false, &request);
+  EXPECT_TRUE(status.ok()) << "code=" << status.error_code()
+                           << " message=" << status.error_message();
+  // Check that the right authority was seen by the server.
+  EXPECT_EQ("from-lb.example.com", response.param().host());
+}
+
+TEST_F(AuthorityOverrideTest, PerRpcOverride) {
+  // We use InsecureCreds here to avoid the authority check in the fake
+  // security connector.
+  StartServers(1, {}, InsecureServerCredentials());
+  FakeResolverResponseGeneratorWrapper response_generator;
+  auto channel = BuildChannel("", response_generator, ChannelArguments(),
+                              InsecureChannelCredentials());
+  auto stub = BuildStub(channel);
+  response_generator.SetNextResolution(GetServersPorts());
+  // Send an RPC.
+  EchoRequest request;
+  request.mutable_param()->set_echo_host_from_authority_header(true);
+  EchoResponse response;
+  Status status = SendRpc(stub, &response, /*timeout_ms=*/1000,
+                          /*wait_for_ready=*/false, &request,
+                          /*authority_override=*/"per-rpc.example.com");
+  EXPECT_TRUE(status.ok()) << "code=" << status.error_code()
+                           << " message=" << status.error_message();
+  // Check that the right authority was seen by the server.
+  EXPECT_EQ("per-rpc.example.com", response.param().host());
+}
+
+TEST_F(AuthorityOverrideTest,
+       ChannelOverrideTakesPrecedenceOverResolverOverride) {
+  StartServers(1);
+  // Set authority via channel arg.
+  FakeResolverResponseGeneratorWrapper response_generator;
+  ChannelArguments args;
+  args.SetString(GRPC_ARG_DEFAULT_AUTHORITY, "from-channel.example.com");
   auto channel = BuildChannel("", response_generator, args);
   auto stub = BuildStub(channel);
   // Inject resolver result that sets the per-address authority to a
@@ -709,7 +810,7 @@ TEST_F(ClientLbEnd2endTest, AuthorityOverridePrecedence) {
   response_generator.SetNextResolution(
       GetServersPorts(), /*service_config_json=*/nullptr,
       grpc_core::ChannelArgs().Set(GRPC_ARG_DEFAULT_AUTHORITY,
-                                   "bar.example.com"));
+                                   "from-resolver.example.com"));
   // Send an RPC.
   EchoRequest request;
   request.mutable_param()->set_echo_host_from_authority_header(true);
@@ -719,7 +820,57 @@ TEST_F(ClientLbEnd2endTest, AuthorityOverridePrecedence) {
   EXPECT_TRUE(status.ok()) << "code=" << status.error_code()
                            << " message=" << status.error_message();
   // Check that the right authority was seen by the server.
-  EXPECT_EQ("foo.example.com", response.param().host());
+  EXPECT_EQ("from-channel.example.com", response.param().host());
+}
+
+TEST_F(AuthorityOverrideTest,
+       LbPolicyOverrideTakesPrecedenceOverChannelOverride) {
+  // We use InsecureCreds here to avoid the authority check in the fake
+  // security connector.
+  StartServers(1, {}, InsecureServerCredentials());
+  FakeResolverResponseGeneratorWrapper response_generator;
+  ChannelArguments args;
+  args.SetString(GRPC_ARG_DEFAULT_AUTHORITY, "from-channel.example.com");
+  args.SetString(GRPC_ARG_TEST_LB_AUTHORITY_OVERRIDE, "from-lb.example.com");
+  auto channel = BuildChannel("authority_override_lb", response_generator, args,
+                              InsecureChannelCredentials());
+  auto stub = BuildStub(channel);
+  response_generator.SetNextResolution(GetServersPorts());
+  // Send an RPC.
+  EchoRequest request;
+  request.mutable_param()->set_echo_host_from_authority_header(true);
+  EchoResponse response;
+  Status status = SendRpc(stub, &response, /*timeout_ms=*/1000,
+                          /*wait_for_ready=*/false, &request);
+  EXPECT_TRUE(status.ok()) << "code=" << status.error_code()
+                           << " message=" << status.error_message();
+  // Check that the right authority was seen by the server.
+  EXPECT_EQ("from-lb.example.com", response.param().host());
+}
+
+TEST_F(AuthorityOverrideTest,
+       PerRpcOverrideTakesPrecedenceOverLbPolicyOverride) {
+  // We use InsecureCreds here to avoid the authority check in the fake
+  // security connector.
+  StartServers(1, {}, InsecureServerCredentials());
+  FakeResolverResponseGeneratorWrapper response_generator;
+  ChannelArguments args;
+  args.SetString(GRPC_ARG_TEST_LB_AUTHORITY_OVERRIDE, "from-lb.example.com");
+  auto channel = BuildChannel("authority_override_lb", response_generator, args,
+                              InsecureChannelCredentials());
+  auto stub = BuildStub(channel);
+  response_generator.SetNextResolution(GetServersPorts());
+  // Send an RPC.
+  EchoRequest request;
+  request.mutable_param()->set_echo_host_from_authority_header(true);
+  EchoResponse response;
+  Status status = SendRpc(stub, &response, /*timeout_ms=*/1000,
+                          /*wait_for_ready=*/false, &request,
+                          /*authority_override=*/"per-rpc.example.com");
+  EXPECT_TRUE(status.ok()) << "code=" << status.error_code()
+                           << " message=" << status.error_message();
+  // Check that the right authority was seen by the server.
+  EXPECT_EQ("per-rpc.example.com", response.param().host());
 }
 
 //
@@ -803,39 +954,49 @@ TEST_F(PickFirstTest, SelectsReadyAtStartup) {
 }
 
 TEST_F(PickFirstTest, BackOffInitialReconnect) {
+  StartServers(1);
   ChannelArguments args;
   constexpr int kInitialBackOffMs = 100;
   args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS,
               kInitialBackOffMs * grpc_test_slowdown_factor());
-  const std::vector<int> ports = {grpc_pick_unused_port_or_die()};
   FakeResolverResponseGeneratorWrapper response_generator;
   auto channel = BuildChannel("pick_first", response_generator, args);
   auto stub = BuildStub(channel);
-  response_generator.SetNextResolution(ports);
-  // Start trying to connect.  The channel will report
-  // TRANSIENT_FAILURE, because the server is not reachable.
-  const grpc_core::Timestamp t0 = grpc_core::Timestamp::Now();
-  ASSERT_TRUE(WaitForChannelState(
-      channel.get(),
-      [&](grpc_connectivity_state state) {
+  response_generator.SetNextResolution({servers_[0]->port_});
+  // Intercept the first two connection attempts.
+  ConnectionAttemptInjector injector;
+  auto hold1 = injector.AddHold(servers_[0]->port_);
+  auto hold2 = injector.AddHold(servers_[0]->port_);
+  // Start trying to connect.
+  EXPECT_EQ(channel->GetState(/*try_to_connect=*/true), GRPC_CHANNEL_IDLE);
+  // When the first connection attempt starts, record the time, then fail the
+  // attempt.
+  hold1->Wait();
+  const grpc_core::Timestamp first_attempt_time = grpc_core::Timestamp::Now();
+  hold1->Fail(absl::UnavailableError("nope"));
+  // Wait for the second attempt and see how long it took.
+  hold2->Wait();
+  const grpc_core::Duration waited =
+      grpc_core::Timestamp::Now() - first_attempt_time;
+  // The channel will transition to TRANSIENT_FAILURE.
+  EXPECT_TRUE(
+      WaitForChannelState(channel.get(), [&](grpc_connectivity_state state) {
         if (state == GRPC_CHANNEL_TRANSIENT_FAILURE) return true;
         EXPECT_THAT(state, ::testing::AnyOf(GRPC_CHANNEL_IDLE,
                                             GRPC_CHANNEL_CONNECTING));
         return false;
-      },
-      /*try_to_connect=*/true));
-  // Bring up a server on the chosen port.
-  StartServers(1, ports);
-  // Now the channel will become connected.
-  ASSERT_TRUE(WaitForChannelReady(channel.get()));
+      }));
+  // Now let the second attempt complete.
+  hold2->Resume();
+  // The channel will transition to READY.
+  EXPECT_TRUE(WaitForChannelReady(channel.get()));
   // Check how long it took.
-  const grpc_core::Duration waited = grpc_core::Timestamp::Now() - t0;
-  gpr_log(GPR_DEBUG, "Waited %" PRId64 " milliseconds", waited.millis());
-  // We should have waited at least kInitialBackOffMs. We substract one to
-  // account for test and precision accuracy drift.
+  VLOG(2) << "Waited " << waited.millis() << " milliseconds";
+  // We should have waited at least kInitialBackOffMs, plus or minus
+  // jitter.  Jitter is 0.2, but we give extra leeway to account for
+  // measurement skew, thread hops, etc.
   EXPECT_GE(waited.millis(),
-            (kInitialBackOffMs * grpc_test_slowdown_factor()) - 1);
-  // But not much more.
+            (kInitialBackOffMs * grpc_test_slowdown_factor()) * 0.7);
   EXPECT_LE(waited.millis(),
             (kInitialBackOffMs * grpc_test_slowdown_factor()) * 1.3);
 }
@@ -861,7 +1022,7 @@ TEST_F(PickFirstTest, BackOffMinReconnect) {
   const gpr_timespec t1 = gpr_now(GPR_CLOCK_MONOTONIC);
   const grpc_core::Duration waited =
       grpc_core::Duration::FromTimespec(gpr_time_sub(t1, t0));
-  gpr_log(GPR_DEBUG, "Waited %" PRId64 " milliseconds", waited.millis());
+  VLOG(2) << "Waited " << waited.millis() << " milliseconds";
   // We should have waited at least kMinReconnectBackOffMs. We substract one to
   // account for test and precision accuracy drift.
   EXPECT_GE(waited.millis(),
@@ -898,7 +1059,7 @@ TEST_F(PickFirstTest, ResetConnectionBackoff) {
   const gpr_timespec t1 = gpr_now(GPR_CLOCK_MONOTONIC);
   const grpc_core::Duration waited =
       grpc_core::Duration::FromTimespec(gpr_time_sub(t1, t0));
-  gpr_log(GPR_DEBUG, "Waited %" PRId64 " milliseconds", waited.millis());
+  VLOG(2) << "Waited " << waited.millis() << " milliseconds";
   // We should have waited less than kInitialBackOffMs.
   EXPECT_LT(waited.millis(), kInitialBackOffMs * grpc_test_slowdown_factor());
 }
@@ -919,33 +1080,33 @@ TEST_F(ClientLbEnd2endTest,
   response_generator.SetNextResolution({port});
   // Intercept initial connection attempt.
   auto hold1 = injector.AddHold(port);
-  gpr_log(GPR_INFO, "=== TRIGGERING INITIAL CONNECTION ATTEMPT");
+  LOG(INFO) << "=== TRIGGERING INITIAL CONNECTION ATTEMPT";
   EXPECT_EQ(GRPC_CHANNEL_IDLE, channel->GetState(/*try_to_connect=*/true));
   hold1->Wait();
   EXPECT_EQ(GRPC_CHANNEL_CONNECTING,
             channel->GetState(/*try_to_connect=*/false));
   // Reset backoff.
-  gpr_log(GPR_INFO, "=== RESETTING BACKOFF");
+  LOG(INFO) << "=== RESETTING BACKOFF";
   experimental::ChannelResetConnectionBackoff(channel.get());
   // Intercept next attempt.  Do this before resuming the first attempt,
   // just in case the client makes progress faster than this thread.
   auto hold2 = injector.AddHold(port);
   // Fail current attempt and wait for next one to start.
-  gpr_log(GPR_INFO, "=== RESUMING INITIAL ATTEMPT");
+  LOG(INFO) << "=== RESUMING INITIAL ATTEMPT";
   const gpr_timespec t0 = gpr_now(GPR_CLOCK_MONOTONIC);
   hold1->Resume();
-  gpr_log(GPR_INFO, "=== WAITING FOR SECOND ATTEMPT");
+  LOG(INFO) << "=== WAITING FOR SECOND ATTEMPT";
   // This WaitForStateChange() call just makes sure we're doing some polling.
   EXPECT_TRUE(channel->WaitForStateChange(GRPC_CHANNEL_CONNECTING,
                                           grpc_timeout_seconds_to_deadline(1)));
   hold2->Wait();
   const gpr_timespec t1 = gpr_now(GPR_CLOCK_MONOTONIC);
-  gpr_log(GPR_INFO, "=== RESUMING SECOND ATTEMPT");
+  LOG(INFO) << "=== RESUMING SECOND ATTEMPT";
   hold2->Resume();
   // Elapsed time should be very short, much less than kInitialBackOffMs.
   const grpc_core::Duration waited =
       grpc_core::Duration::FromTimespec(gpr_time_sub(t1, t0));
-  gpr_log(GPR_DEBUG, "Waited %" PRId64 " milliseconds", waited.millis());
+  VLOG(2) << "Waited " << waited.millis() << " milliseconds";
   EXPECT_LT(waited.millis(), 1000 * grpc_test_slowdown_factor());
 }
 
@@ -958,21 +1119,21 @@ TEST_F(PickFirstTest, Updates) {
   auto stub = BuildStub(channel);
   // Perform one RPC against the first server.
   response_generator.SetNextResolution(GetServersPorts(0, 1));
-  gpr_log(GPR_INFO, "****** SET [0] *******");
+  LOG(INFO) << "****** SET [0] *******";
   CheckRpcSendOk(DEBUG_LOCATION, stub);
   EXPECT_EQ(servers_[0]->service_.request_count(), 1);
   // An empty update will result in the channel going into TRANSIENT_FAILURE.
   response_generator.SetNextResolution({});
-  gpr_log(GPR_INFO, "****** SET none *******");
+  LOG(INFO) << "****** SET none *******";
   WaitForChannelNotReady(channel.get());
   // Next update introduces servers_[1], making the channel recover.
   response_generator.SetNextResolution(GetServersPorts(1, 2));
-  gpr_log(GPR_INFO, "****** SET [1] *******");
+  LOG(INFO) << "****** SET [1] *******";
   WaitForChannelReady(channel.get());
   WaitForServer(DEBUG_LOCATION, stub, 1);
   // And again for servers_[2]
   response_generator.SetNextResolution(GetServersPorts(2, 3));
-  gpr_log(GPR_INFO, "****** SET [2] *******");
+  LOG(INFO) << "****** SET [2] *******";
   WaitForServer(DEBUG_LOCATION, stub, 2);
   // Check LB policy name for the channel.
   EXPECT_EQ("pick_first", channel->GetLoadBalancingPolicyName());
@@ -991,7 +1152,7 @@ TEST_F(PickFirstTest, UpdateSuperset) {
   // Perform one RPC against the first server.
   ports.emplace_back(servers_[0]->port_);
   response_generator.SetNextResolution(ports);
-  gpr_log(GPR_INFO, "****** SET [0] *******");
+  LOG(INFO) << "****** SET [0] *******";
   CheckRpcSendOk(DEBUG_LOCATION, stub);
   EXPECT_EQ(servers_[0]->service_.request_count(), 1);
   servers_[0]->service_.ResetCounters();
@@ -1001,7 +1162,7 @@ TEST_F(PickFirstTest, UpdateSuperset) {
   ports.emplace_back(servers_[1]->port_);
   ports.emplace_back(servers_[0]->port_);
   response_generator.SetNextResolution(ports);
-  gpr_log(GPR_INFO, "****** SET superset *******");
+  LOG(INFO) << "****** SET superset *******";
   CheckRpcSendOk(DEBUG_LOCATION, stub);
   // We stick to the previously connected server.
   WaitForServer(DEBUG_LOCATION, stub, 0);
@@ -1024,7 +1185,7 @@ TEST_F(PickFirstTest, UpdateToUnconnected) {
   // Try to send rpcs against a list where the server is available.
   ports.emplace_back(servers_[0]->port_);
   response_generator.SetNextResolution(ports);
-  gpr_log(GPR_INFO, "****** SET [0] *******");
+  LOG(INFO) << "****** SET [0] *******";
   CheckRpcSendOk(DEBUG_LOCATION, stub);
 
   // Send resolution for which all servers are currently unavailable. Eventually
@@ -1034,12 +1195,12 @@ TEST_F(PickFirstTest, UpdateToUnconnected) {
   ports.emplace_back(grpc_pick_unused_port_or_die());
   ports.emplace_back(servers_[1]->port_);
   response_generator.SetNextResolution(ports);
-  gpr_log(GPR_INFO, "****** SET [unavailable] *******");
+  LOG(INFO) << "****** SET [unavailable] *******";
   EXPECT_TRUE(WaitForChannelNotReady(channel.get()));
 
   // Ensure that the last resolution was installed correctly by verifying that
   // the channel becomes ready once one of if its endpoints becomes available.
-  gpr_log(GPR_INFO, "****** StartServer(1) *******");
+  LOG(INFO) << "****** StartServer(1) *******";
   StartServer(1);
   EXPECT_TRUE(WaitForChannelReady(channel.get()));
 }
@@ -1050,12 +1211,18 @@ TEST_F(PickFirstTest, GlobalSubchannelPool) {
   StartServers(kNumServers);
   std::vector<int> ports = GetServersPorts();
   // Create two channels that (by default) use the global subchannel pool.
+  // Use the same channel creds for both, so that they have the same
+  // subchannel keys.
+  auto channel_creds =
+      std::make_shared<FakeTransportSecurityChannelCredentials>();
   FakeResolverResponseGeneratorWrapper response_generator1;
-  auto channel1 = BuildChannel("pick_first", response_generator1);
+  auto channel1 = BuildChannel("pick_first", response_generator1,
+                               ChannelArguments(), channel_creds);
   auto stub1 = BuildStub(channel1);
   response_generator1.SetNextResolution(ports);
   FakeResolverResponseGeneratorWrapper response_generator2;
-  auto channel2 = BuildChannel("pick_first", response_generator2);
+  auto channel2 = BuildChannel("pick_first", response_generator2,
+                               ChannelArguments(), channel_creds);
   auto stub2 = BuildStub(channel2);
   response_generator2.SetNextResolution(ports);
   WaitForServer(DEBUG_LOCATION, stub1, 0);
@@ -1135,21 +1302,21 @@ TEST_F(PickFirstTest, ReresolutionNoSelected) {
   // The initial resolution only contains dead ports. There won't be any
   // selected subchannel. Re-resolution will return the same result.
   response_generator.SetNextResolution(dead_ports);
-  gpr_log(GPR_INFO, "****** INITIAL RESOLUTION SET *******");
+  LOG(INFO) << "****** INITIAL RESOLUTION SET *******";
   for (size_t i = 0; i < 10; ++i) {
     CheckRpcSendFailure(
         DEBUG_LOCATION, stub, StatusCode::UNAVAILABLE,
         MakeConnectionFailureRegex("failed to connect to all addresses"));
   }
   // PF should request re-resolution.
-  gpr_log(GPR_INFO, "****** WAITING FOR RE-RESOLUTION *******");
+  LOG(INFO) << "****** WAITING FOR RE-RESOLUTION *******";
   EXPECT_TRUE(response_generator.Get()->WaitForReresolutionRequest(
       absl::Seconds(5 * grpc_test_slowdown_factor())));
-  gpr_log(GPR_INFO, "****** RE-RESOLUTION SEEN *******");
+  LOG(INFO) << "****** RE-RESOLUTION SEEN *******";
   // Send a resolver result that contains reachable ports, so that the
   // pick_first LB policy can recover soon.
   response_generator.SetNextResolution(alive_ports);
-  gpr_log(GPR_INFO, "****** RE-RESOLUTION SENT *******");
+  LOG(INFO) << "****** RE-RESOLUTION SENT *******";
   WaitForServer(DEBUG_LOCATION, stub, 0, [](const Status& status) {
     EXPECT_EQ(StatusCode::UNAVAILABLE, status.error_code());
     EXPECT_THAT(status.error_message(),
@@ -1169,12 +1336,12 @@ TEST_F(PickFirstTest, ReconnectWithoutNewResolverResult) {
   auto channel = BuildChannel("pick_first", response_generator);
   auto stub = BuildStub(channel);
   response_generator.SetNextResolution(ports);
-  gpr_log(GPR_INFO, "****** INITIAL CONNECTION *******");
+  LOG(INFO) << "****** INITIAL CONNECTION *******";
   WaitForServer(DEBUG_LOCATION, stub, 0);
-  gpr_log(GPR_INFO, "****** STOPPING SERVER ******");
+  LOG(INFO) << "****** STOPPING SERVER ******";
   servers_[0]->Shutdown();
   EXPECT_TRUE(WaitForChannelNotReady(channel.get()));
-  gpr_log(GPR_INFO, "****** RESTARTING SERVER ******");
+  LOG(INFO) << "****** RESTARTING SERVER ******";
   StartServers(1, ports);
   WaitForServer(DEBUG_LOCATION, stub, 0);
 }
@@ -1188,12 +1355,12 @@ TEST_F(PickFirstTest, ReconnectWithoutNewResolverResultStartsFromTopOfList) {
   auto channel = BuildChannel("pick_first", response_generator);
   auto stub = BuildStub(channel);
   response_generator.SetNextResolution(ports);
-  gpr_log(GPR_INFO, "****** INITIAL CONNECTION *******");
+  LOG(INFO) << "****** INITIAL CONNECTION *******";
   WaitForServer(DEBUG_LOCATION, stub, 1);
-  gpr_log(GPR_INFO, "****** STOPPING SERVER ******");
+  LOG(INFO) << "****** STOPPING SERVER ******";
   servers_[1]->Shutdown();
   EXPECT_TRUE(WaitForChannelNotReady(channel.get()));
-  gpr_log(GPR_INFO, "****** STARTING BOTH SERVERS ******");
+  LOG(INFO) << "****** STARTING BOTH SERVERS ******";
   StartServers(2, ports);
   WaitForServer(DEBUG_LOCATION, stub, 0);
 }
@@ -1202,21 +1369,21 @@ TEST_F(PickFirstTest, FailsEmptyResolverUpdate) {
   FakeResolverResponseGeneratorWrapper response_generator;
   auto channel = BuildChannel("pick_first", response_generator);
   auto stub = BuildStub(channel);
-  gpr_log(GPR_INFO, "****** SENDING INITIAL RESOLVER RESULT *******");
+  LOG(INFO) << "****** SENDING INITIAL RESOLVER RESULT *******";
   // Send a resolver result with an empty address list and a callback
   // that triggers a notification.
   grpc_core::Notification notification;
   grpc_core::Resolver::Result result;
   result.addresses.emplace();
   result.result_health_callback = [&](absl::Status status) {
-    gpr_log(GPR_INFO, "****** RESULT HEALTH CALLBACK *******");
+    LOG(INFO) << "****** RESULT HEALTH CALLBACK *******";
     EXPECT_EQ(absl::StatusCode::kUnavailable, status.code());
     EXPECT_EQ("address list must not be empty", status.message()) << status;
     notification.Notify();
   };
   response_generator.SetResponse(std::move(result));
   // Wait for channel to report TRANSIENT_FAILURE.
-  gpr_log(GPR_INFO, "****** TELLING CHANNEL TO CONNECT *******");
+  LOG(INFO) << "****** TELLING CHANNEL TO CONNECT *******";
   auto predicate = [](grpc_connectivity_state state) {
     return state == GRPC_CHANNEL_TRANSIENT_FAILURE;
   };
@@ -1225,10 +1392,10 @@ TEST_F(PickFirstTest, FailsEmptyResolverUpdate) {
   // Callback should run.
   notification.WaitForNotification();
   // Return a valid address.
-  gpr_log(GPR_INFO, "****** SENDING NEXT RESOLVER RESULT *******");
+  LOG(INFO) << "****** SENDING NEXT RESOLVER RESULT *******";
   StartServers(1);
   response_generator.SetNextResolution(GetServersPorts());
-  gpr_log(GPR_INFO, "****** SENDING WAIT_FOR_READY RPC *******");
+  LOG(INFO) << "****** SENDING WAIT_FOR_READY RPC *******";
   CheckRpcSendOk(DEBUG_LOCATION, stub, /*wait_for_ready=*/true);
 }
 
@@ -1239,22 +1406,22 @@ TEST_F(PickFirstTest, CheckStateBeforeStartWatch) {
   auto channel_1 = BuildChannel("pick_first", response_generator);
   auto stub_1 = BuildStub(channel_1);
   response_generator.SetNextResolution(ports);
-  gpr_log(GPR_INFO, "****** RESOLUTION SET FOR CHANNEL 1 *******");
+  LOG(INFO) << "****** RESOLUTION SET FOR CHANNEL 1 *******";
   WaitForServer(DEBUG_LOCATION, stub_1, 0);
-  gpr_log(GPR_INFO, "****** CHANNEL 1 CONNECTED *******");
+  LOG(INFO) << "****** CHANNEL 1 CONNECTED *******";
   servers_[0]->Shutdown();
   EXPECT_TRUE(WaitForChannelNotReady(channel_1.get()));
   // Channel 1 will receive a re-resolution containing the same server. It will
   // create a new subchannel and hold a ref to it.
   StartServers(1, ports);
-  gpr_log(GPR_INFO, "****** SERVER RESTARTED *******");
+  LOG(INFO) << "****** SERVER RESTARTED *******";
   FakeResolverResponseGeneratorWrapper response_generator_2;
   auto channel_2 = BuildChannel("pick_first", response_generator_2);
   auto stub_2 = BuildStub(channel_2);
   response_generator_2.SetNextResolution(ports);
-  gpr_log(GPR_INFO, "****** RESOLUTION SET FOR CHANNEL 2 *******");
+  LOG(INFO) << "****** RESOLUTION SET FOR CHANNEL 2 *******";
   WaitForServer(DEBUG_LOCATION, stub_2, 0);
-  gpr_log(GPR_INFO, "****** CHANNEL 2 CONNECTED *******");
+  LOG(INFO) << "****** CHANNEL 2 CONNECTED *******";
   servers_[0]->Shutdown();
   // Wait until the disconnection has triggered the connectivity notification.
   // Otherwise, the subchannel may be picked for next call but will fail soon.
@@ -1262,11 +1429,11 @@ TEST_F(PickFirstTest, CheckStateBeforeStartWatch) {
   // Channel 2 will also receive a re-resolution containing the same server.
   // Both channels will ref the same subchannel that failed.
   StartServers(1, ports);
-  gpr_log(GPR_INFO, "****** SERVER RESTARTED AGAIN *******");
-  gpr_log(GPR_INFO, "****** CHANNEL 2 STARTING A CALL *******");
+  LOG(INFO) << "****** SERVER RESTARTED AGAIN *******";
+  LOG(INFO) << "****** CHANNEL 2 STARTING A CALL *******";
   // The first call after the server restart will succeed.
   CheckRpcSendOk(DEBUG_LOCATION, stub_2);
-  gpr_log(GPR_INFO, "****** CHANNEL 2 FINISHED A CALL *******");
+  LOG(INFO) << "****** CHANNEL 2 FINISHED A CALL *******";
   // Check LB policy name for the channel.
   EXPECT_EQ("pick_first", channel_1->GetLoadBalancingPolicyName());
   // Check LB policy name for the channel.
@@ -1411,7 +1578,7 @@ TEST_F(RoundRobinTest, Updates) {
   auto channel = BuildChannel("round_robin", response_generator);
   auto stub = BuildStub(channel);
   // Start with a single server.
-  gpr_log(GPR_INFO, "*** FIRST BACKEND ***");
+  LOG(INFO) << "*** FIRST BACKEND ***";
   std::vector<int> ports = {servers_[0]->port_};
   response_generator.SetNextResolution(ports);
   WaitForServer(DEBUG_LOCATION, stub, 0);
@@ -1422,7 +1589,7 @@ TEST_F(RoundRobinTest, Updates) {
   EXPECT_EQ(0, servers_[2]->service_.request_count());
   ResetCounters();
   // And now for the second server.
-  gpr_log(GPR_INFO, "*** SECOND BACKEND ***");
+  LOG(INFO) << "*** SECOND BACKEND ***";
   ports.clear();
   ports.emplace_back(servers_[1]->port_);
   response_generator.SetNextResolution(ports);
@@ -1436,7 +1603,7 @@ TEST_F(RoundRobinTest, Updates) {
   EXPECT_EQ(0, servers_[2]->service_.request_count());
   ResetCounters();
   // ... and for the last server.
-  gpr_log(GPR_INFO, "*** THIRD BACKEND ***");
+  LOG(INFO) << "*** THIRD BACKEND ***";
   ports.clear();
   ports.emplace_back(servers_[2]->port_);
   response_generator.SetNextResolution(ports);
@@ -1447,7 +1614,7 @@ TEST_F(RoundRobinTest, Updates) {
   EXPECT_EQ(10, servers_[2]->service_.request_count());
   ResetCounters();
   // Back to all servers.
-  gpr_log(GPR_INFO, "*** ALL BACKENDS ***");
+  LOG(INFO) << "*** ALL BACKENDS ***";
   ports.clear();
   ports.emplace_back(servers_[0]->port_);
   ports.emplace_back(servers_[1]->port_);
@@ -1461,7 +1628,7 @@ TEST_F(RoundRobinTest, Updates) {
   EXPECT_EQ(1, servers_[2]->service_.request_count());
   ResetCounters();
   // An empty update will result in the channel going into TRANSIENT_FAILURE.
-  gpr_log(GPR_INFO, "*** NO BACKENDS ***");
+  LOG(INFO) << "*** NO BACKENDS ***";
   ports.clear();
   response_generator.SetNextResolution(ports);
   WaitForChannelNotReady(channel.get());
@@ -1469,7 +1636,7 @@ TEST_F(RoundRobinTest, Updates) {
                       "empty address list: fake resolver empty address list");
   servers_[0]->service_.ResetCounters();
   // Next update introduces servers_[1], making the channel recover.
-  gpr_log(GPR_INFO, "*** BACK TO SECOND BACKEND ***");
+  LOG(INFO) << "*** BACK TO SECOND BACKEND ***";
   ports.clear();
   ports.emplace_back(servers_[1]->port_);
   response_generator.SetNextResolution(ports);
@@ -1550,15 +1717,15 @@ TEST_F(RoundRobinTest, ReresolveOnSubchannelConnectionFailure) {
   // Wait for both servers to be seen.
   WaitForServers(DEBUG_LOCATION, stub, 0, 2);
   // Have server 0 send a GOAWAY.  This should trigger a re-resolution.
-  gpr_log(GPR_INFO, "****** SENDING GOAWAY FROM SERVER 0 *******");
+  LOG(INFO) << "****** SENDING GOAWAY FROM SERVER 0 *******";
   {
     grpc_core::ExecCtx exec_ctx;
     grpc_core::Server::FromC(servers_[0]->server_->c_server())->SendGoaways();
   }
-  gpr_log(GPR_INFO, "****** WAITING FOR RE-RESOLUTION REQUEST *******");
+  LOG(INFO) << "****** WAITING FOR RE-RESOLUTION REQUEST *******";
   EXPECT_TRUE(response_generator.Get()->WaitForReresolutionRequest(
       absl::Seconds(5 * grpc_test_slowdown_factor())));
-  gpr_log(GPR_INFO, "****** RE-RESOLUTION REQUEST SEEN *******");
+  LOG(INFO) << "****** RE-RESOLUTION REQUEST SEEN *******";
   // Tell the fake resolver to send an update that adds the last server, but
   // only when the LB policy requests re-resolution.
   ports.push_back(servers_[2]->port_);
@@ -1571,7 +1738,7 @@ TEST_F(RoundRobinTest, FailsEmptyResolverUpdate) {
   FakeResolverResponseGeneratorWrapper response_generator;
   auto channel = BuildChannel("round_robin", response_generator);
   auto stub = BuildStub(channel);
-  gpr_log(GPR_INFO, "****** SENDING INITIAL RESOLVER RESULT *******");
+  LOG(INFO) << "****** SENDING INITIAL RESOLVER RESULT *******";
   // Send a resolver result with an empty address list and a callback
   // that triggers a notification.
   grpc_core::Notification notification;
@@ -1585,7 +1752,7 @@ TEST_F(RoundRobinTest, FailsEmptyResolverUpdate) {
   };
   response_generator.SetResponse(std::move(result));
   // Wait for channel to report TRANSIENT_FAILURE.
-  gpr_log(GPR_INFO, "****** TELLING CHANNEL TO CONNECT *******");
+  LOG(INFO) << "****** TELLING CHANNEL TO CONNECT *******";
   auto predicate = [](grpc_connectivity_state state) {
     return state == GRPC_CHANNEL_TRANSIENT_FAILURE;
   };
@@ -1594,10 +1761,10 @@ TEST_F(RoundRobinTest, FailsEmptyResolverUpdate) {
   // Callback should have been run.
   notification.WaitForNotification();
   // Return a valid address.
-  gpr_log(GPR_INFO, "****** SENDING NEXT RESOLVER RESULT *******");
+  LOG(INFO) << "****** SENDING NEXT RESOLVER RESULT *******";
   StartServers(1);
   response_generator.SetNextResolution(GetServersPorts());
-  gpr_log(GPR_INFO, "****** SENDING WAIT_FOR_READY RPC *******");
+  LOG(INFO) << "****** SENDING WAIT_FOR_READY RPC *******";
   CheckRpcSendOk(DEBUG_LOCATION, stub, /*wait_for_ready=*/true);
 }
 
@@ -1658,7 +1825,7 @@ TEST_F(RoundRobinTest, StaysInTransientFailureInSubsequentConnecting) {
   response_generator.SetNextResolution({port});
   // Allow first connection attempt to fail normally, and wait for
   // channel to report TRANSIENT_FAILURE.
-  gpr_log(GPR_INFO, "=== WAITING FOR CHANNEL TO REPORT TF ===");
+  LOG(INFO) << "=== WAITING FOR CHANNEL TO REPORT TF ===";
   auto predicate = [](grpc_connectivity_state state) {
     return state == GRPC_CHANNEL_TRANSIENT_FAILURE;
   };
@@ -1673,7 +1840,7 @@ TEST_F(RoundRobinTest, StaysInTransientFailureInSubsequentConnecting) {
   EXPECT_EQ(GRPC_CHANNEL_TRANSIENT_FAILURE, channel->GetState(false));
   // Send a few RPCs, just to give the channel a chance to propagate a
   // new picker, in case it was going to incorrectly do so.
-  gpr_log(GPR_INFO, "=== EXPECTING RPCs TO FAIL ===");
+  LOG(INFO) << "=== EXPECTING RPCs TO FAIL ===";
   for (size_t i = 0; i < 5; ++i) {
     CheckRpcSendFailure(
         DEBUG_LOCATION, stub, StatusCode::UNAVAILABLE,
@@ -1718,7 +1885,7 @@ TEST_F(RoundRobinTest, ReportsLatestStatusInTransientFailure) {
             "Survey says... Bzzzzt!"))(status.error_message())) {
       break;
     }
-    gpr_log(GPR_INFO, "STATUS MESSAGE: %s", status.error_message().c_str());
+    LOG(INFO) << "STATUS MESSAGE: " << status.error_message();
     EXPECT_THAT(status.error_message(),
                 ::testing::MatchesRegex(MakeConnectionFailureRegex(
                     "connections to all backends failing")));
@@ -1740,21 +1907,21 @@ TEST_F(RoundRobinTest, DoesNotFailRpcsUponDisconnection) {
   auto stub = BuildStub(channel);
   response_generator.SetNextResolution(GetServersPorts());
   // Start a thread constantly sending RPCs in a loop.
-  gpr_log(GPR_INFO, "=== STARTING CLIENT THREAD ===");
+  LOG(INFO) << "=== STARTING CLIENT THREAD ===";
   std::atomic<bool> shutdown{false};
   gpr_event ev;
   gpr_event_init(&ev);
   std::thread thd([&]() {
-    gpr_log(GPR_INFO, "sending first RPC");
+    LOG(INFO) << "sending first RPC";
     CheckRpcSendOk(DEBUG_LOCATION, stub);
     gpr_event_set(&ev, reinterpret_cast<void*>(1));
     while (!shutdown.load()) {
-      gpr_log(GPR_INFO, "sending RPC");
+      LOG(INFO) << "sending RPC";
       CheckRpcSendOk(DEBUG_LOCATION, stub);
     }
   });
   // Wait for first RPC to complete.
-  gpr_log(GPR_INFO, "=== WAITING FOR FIRST RPC TO COMPLETE ===");
+  LOG(INFO) << "=== WAITING FOR FIRST RPC TO COMPLETE ===";
   ASSERT_EQ(reinterpret_cast<void*>(1),
             gpr_event_wait(&ev, grpc_timeout_seconds_to_deadline(1)));
   // Channel should now be READY.
@@ -1765,7 +1932,7 @@ TEST_F(RoundRobinTest, DoesNotFailRpcsUponDisconnection) {
   // Now kill the server.  The subchannel should report IDLE and be
   // immediately reconnected to, but this should not cause any test
   // failures.
-  gpr_log(GPR_INFO, "=== SHUTTING DOWN SERVER ===");
+  LOG(INFO) << "=== SHUTTING DOWN SERVER ===";
   {
     grpc_core::ExecCtx exec_ctx;
     grpc_core::Server::FromC(servers_[0]->server_->c_server())->SendGoaways();
@@ -1773,17 +1940,17 @@ TEST_F(RoundRobinTest, DoesNotFailRpcsUponDisconnection) {
   gpr_sleep_until(grpc_timeout_seconds_to_deadline(1));
   servers_[0]->Shutdown();
   // Wait for next attempt to start.
-  gpr_log(GPR_INFO, "=== WAITING FOR RECONNECTION ATTEMPT ===");
+  LOG(INFO) << "=== WAITING FOR RECONNECTION ATTEMPT ===";
   hold1->Wait();
   // Start server and allow attempt to continue.
-  gpr_log(GPR_INFO, "=== RESTARTING SERVER ===");
+  LOG(INFO) << "=== RESTARTING SERVER ===";
   StartServer(0);
   hold1->Resume();
   // Wait for next attempt to complete.
-  gpr_log(GPR_INFO, "=== WAITING FOR RECONNECTION ATTEMPT TO COMPLETE ===");
+  LOG(INFO) << "=== WAITING FOR RECONNECTION ATTEMPT TO COMPLETE ===";
   hold1->WaitForCompletion();
   // Now shut down the thread.
-  gpr_log(GPR_INFO, "=== SHUTTING DOWN CLIENT THREAD ===");
+  LOG(INFO) << "=== SHUTTING DOWN CLIENT THREAD ===";
   shutdown.store(true);
   thd.join();
 }
@@ -1871,14 +2038,13 @@ TEST_F(RoundRobinTest, HealthChecking) {
   auto stub = BuildStub(channel);
   response_generator.SetNextResolution(GetServersPorts());
   // Channel should not become READY, because health checks should be failing.
-  gpr_log(GPR_INFO,
-          "*** initial state: unknown health check service name for "
-          "all servers");
+  LOG(INFO)
+      << "*** initial state: unknown health check service name for all servers";
   EXPECT_FALSE(WaitForChannelReady(channel.get(), 1));
   // Now set one of the servers to be healthy.
   // The channel should become healthy and all requests should go to
   // the healthy server.
-  gpr_log(GPR_INFO, "*** server 0 healthy");
+  LOG(INFO) << "*** server 0 healthy";
   servers_[0]->SetServingStatus("health_check_service_name", true);
   EXPECT_TRUE(WaitForChannelReady(channel.get()));
   // New channel state may be reported before the picker is updated, so
@@ -1891,7 +2057,7 @@ TEST_F(RoundRobinTest, HealthChecking) {
   EXPECT_EQ(0, servers_[1]->service_.request_count());
   EXPECT_EQ(0, servers_[2]->service_.request_count());
   // Now set a second server to be healthy.
-  gpr_log(GPR_INFO, "*** server 2 healthy");
+  LOG(INFO) << "*** server 2 healthy";
   servers_[2]->SetServingStatus("health_check_service_name", true);
   WaitForServer(DEBUG_LOCATION, stub, 2);
   for (int i = 0; i < 10; ++i) {
@@ -1901,7 +2067,7 @@ TEST_F(RoundRobinTest, HealthChecking) {
   EXPECT_EQ(0, servers_[1]->service_.request_count());
   EXPECT_EQ(5, servers_[2]->service_.request_count());
   // Now set the remaining server to be healthy.
-  gpr_log(GPR_INFO, "*** server 1 healthy");
+  LOG(INFO) << "*** server 1 healthy";
   servers_[1]->SetServingStatus("health_check_service_name", true);
   WaitForServer(DEBUG_LOCATION, stub, 1);
   for (int i = 0; i < 9; ++i) {
@@ -1914,7 +2080,7 @@ TEST_F(RoundRobinTest, HealthChecking) {
   // unhealthiness has hit the client.  We know that the client will see
   // this when we send kNumServers requests and one of the remaining servers
   // sees two of the requests.
-  gpr_log(GPR_INFO, "*** server 0 unhealthy");
+  LOG(INFO) << "*** server 0 unhealthy";
   servers_[0]->SetServingStatus("health_check_service_name", false);
   do {
     ResetCounters();
@@ -1925,7 +2091,7 @@ TEST_F(RoundRobinTest, HealthChecking) {
            servers_[2]->service_.request_count() != 2);
   // Now set the remaining two servers to be unhealthy.  Make sure the
   // channel leaves READY state and that RPCs fail.
-  gpr_log(GPR_INFO, "*** all servers unhealthy");
+  LOG(INFO) << "*** all servers unhealthy";
   servers_[1]->SetServingStatus("health_check_service_name", false);
   servers_[2]->SetServingStatus("health_check_service_name", false);
   EXPECT_TRUE(WaitForChannelNotReady(channel.get()));
@@ -1977,20 +2143,26 @@ TEST_F(RoundRobinTest, WithHealthCheckingInhibitPerChannel) {
   // Start server.
   const int kNumServers = 1;
   StartServers(kNumServers);
+  // Use the same channel creds for both channels, so that they have the same
+  // subchannel keys.
+  auto channel_creds =
+      std::make_shared<FakeTransportSecurityChannelCredentials>();
   // Create a channel with health-checking enabled.
   ChannelArguments args;
   args.SetServiceConfigJSON(
       "{\"healthCheckConfig\": "
       "{\"serviceName\": \"health_check_service_name\"}}");
   FakeResolverResponseGeneratorWrapper response_generator1;
-  auto channel1 = BuildChannel("round_robin", response_generator1, args);
+  auto channel1 =
+      BuildChannel("round_robin", response_generator1, args, channel_creds);
   auto stub1 = BuildStub(channel1);
   std::vector<int> ports = GetServersPorts();
   response_generator1.SetNextResolution(ports);
   // Create a channel with health checking enabled but inhibited.
   args.SetInt(GRPC_ARG_INHIBIT_HEALTH_CHECKING, 1);
   FakeResolverResponseGeneratorWrapper response_generator2;
-  auto channel2 = BuildChannel("round_robin", response_generator2, args);
+  auto channel2 =
+      BuildChannel("round_robin", response_generator2, args, channel_creds);
   auto stub2 = BuildStub(channel2);
   response_generator2.SetNextResolution(ports);
   // First channel should not become READY, because health checks should be
@@ -2017,13 +2189,18 @@ TEST_F(RoundRobinTest, HealthCheckingServiceNamePerChannel) {
   // Start server.
   const int kNumServers = 1;
   StartServers(kNumServers);
+  // Use the same channel creds for both channels, so that they have the same
+  // subchannel keys.
+  auto channel_creds =
+      std::make_shared<FakeTransportSecurityChannelCredentials>();
   // Create a channel with health-checking enabled.
   ChannelArguments args;
   args.SetServiceConfigJSON(
       "{\"healthCheckConfig\": "
       "{\"serviceName\": \"health_check_service_name\"}}");
   FakeResolverResponseGeneratorWrapper response_generator1;
-  auto channel1 = BuildChannel("round_robin", response_generator1, args);
+  auto channel1 =
+      BuildChannel("round_robin", response_generator1, args, channel_creds);
   auto stub1 = BuildStub(channel1);
   std::vector<int> ports = GetServersPorts();
   response_generator1.SetNextResolution(ports);
@@ -2034,7 +2211,8 @@ TEST_F(RoundRobinTest, HealthCheckingServiceNamePerChannel) {
       "{\"healthCheckConfig\": "
       "{\"serviceName\": \"health_check_service_name2\"}}");
   FakeResolverResponseGeneratorWrapper response_generator2;
-  auto channel2 = BuildChannel("round_robin", response_generator2, args2);
+  auto channel2 =
+      BuildChannel("round_robin", response_generator2, args2, channel_creds);
   auto stub2 = BuildStub(channel2);
   response_generator2.SetNextResolution(ports);
   // Allow health checks from channel 2 to succeed.
@@ -2195,6 +2373,10 @@ TEST_F(ClientLbPickArgsTest, Basic) {
       << ArgsSeenListString(pick_args_seen_list);
 }
 
+//
+// tests that LB policies can get the call's trailing metadata
+//
+
 class OrcaLoadReportBuilder {
  public:
   OrcaLoadReportBuilder() = default;
@@ -2237,10 +2419,6 @@ class OrcaLoadReportBuilder {
  private:
   OrcaLoadReport report_;
 };
-
-//
-// tests that LB policies can get the call's trailing metadata
-//
 
 OrcaLoadReport BackendMetricDataToOrcaLoadReport(
     const grpc_core::BackendMetricData& backend_metric_data) {
@@ -2693,7 +2871,7 @@ TEST_F(ClientLbInterceptTrailingMetadataTest, BackendMetricDataMerge) {
 }
 
 //
-// tests that address args from the resolver are visible to the LB policy
+// tests that per-address args from the resolver are visible to the LB policy
 //
 
 class ClientLbAddressTest : public ClientLbEnd2endTest {
@@ -2718,7 +2896,7 @@ class ClientLbAddressTest : public ClientLbEnd2endTest {
     grpc_core::CoreConfiguration::Reset();
   }
 
-  const std::vector<std::string>& addresses_seen() {
+  std::vector<std::string> addresses_seen() {
     grpc_core::MutexLock lock(&mu_);
     return addresses_seen_;
   }
@@ -2732,7 +2910,7 @@ class ClientLbAddressTest : public ClientLbEnd2endTest {
 
   static ClientLbAddressTest* current_test_instance_;
   grpc_core::Mutex mu_;
-  std::vector<std::string> addresses_seen_;
+  std::vector<std::string> addresses_seen_ ABSL_GUARDED_BY(&mu_);
 };
 
 ClientLbAddressTest* ClientLbAddressTest::current_test_instance_ = nullptr;
@@ -2941,7 +3119,10 @@ TEST_F(ControlPlaneStatusRewritingTest, RewritesFromConfigSelector) {
    public:
     explicit FailConfigSelector(absl::Status status)
         : status_(std::move(status)) {}
-    const char* name() const override { return "FailConfigSelector"; }
+    grpc_core::UniqueTypeName name() const override {
+      static grpc_core::UniqueTypeName::Factory kFactory("FailConfigSelector");
+      return kFactory.Create();
+    }
     bool Equals(const ConfigSelector* other) const override {
       return status_ == static_cast<const FailConfigSelector*>(other)->status_;
     }
@@ -3018,7 +3199,7 @@ class WeightedRoundRobinTest : public ClientLbEnd2endTest {
       const std::unique_ptr<grpc::testing::EchoTestService::Stub>& stub,
       const std::vector<size_t>& expected_weights, size_t total_passes = 3,
       EchoRequest* request_ptr = nullptr, int timeout_ms = 15000) {
-    CHECK(expected_weights.size() == servers_.size());
+    CHECK_EQ(expected_weights.size(), servers_.size());
     size_t total_picks_per_pass = 0;
     for (size_t picks : expected_weights) {
       total_picks_per_pass += picks;

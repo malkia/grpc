@@ -23,6 +23,7 @@
 
 #include <utility>
 
+#include "absl/log/check.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/optional.h"
 #include "absl/types/span.h"
@@ -46,7 +47,7 @@ inline opentelemetry::nostd::string_view AbslStrViewToOpenTelemetryStrView(
 // An iterable class based on opentelemetry::common::KeyValueIterable that
 // allows gRPC to iterate on its various sources of attributes and avoid an
 // allocation in cases wherever possible.
-class OpenTelemetryPlugin::KeyValueIterable
+class OpenTelemetryPluginImpl::KeyValueIterable
     : public opentelemetry::common::KeyValueIterable {
  public:
   KeyValueIterable(
@@ -54,10 +55,10 @@ class OpenTelemetryPlugin::KeyValueIterable
           injected_labels_from_plugin_options,
       absl::Span<const std::pair<absl::string_view, absl::string_view>>
           additional_labels,
-      const OpenTelemetryPlugin::ActivePluginOptionsView*
+      const OpenTelemetryPluginImpl::ActivePluginOptionsView*
           active_plugin_options_view,
       absl::Span<const grpc_core::RefCountedStringValue> optional_labels,
-      bool is_client, const OpenTelemetryPlugin* otel_plugin)
+      bool is_client, const OpenTelemetryPluginImpl* otel_plugin)
       : injected_labels_from_plugin_options_(
             injected_labels_from_plugin_options),
         additional_labels_(additional_labels),
@@ -101,10 +102,9 @@ class OpenTelemetryPlugin::KeyValueIterable
     }
     // Add per-call optional labels
     if (!optional_labels_.empty()) {
-      GPR_ASSERT(
-          optional_labels_.size() ==
-          static_cast<size_t>(grpc_core::ClientCallTracer::CallAttemptTracer::
-                                  OptionalLabelKey::kSize));
+      CHECK(optional_labels_.size() ==
+            static_cast<size_t>(grpc_core::ClientCallTracer::CallAttemptTracer::
+                                    OptionalLabelKey::kSize));
       for (size_t i = 0; i < optional_labels_.size(); ++i) {
         if (!otel_plugin_->per_call_optional_label_bits_.test(i)) {
           continue;
@@ -149,11 +149,11 @@ class OpenTelemetryPlugin::KeyValueIterable
       injected_labels_from_plugin_options_;
   absl::Span<const std::pair<absl::string_view, absl::string_view>>
       additional_labels_;
-  const OpenTelemetryPlugin::ActivePluginOptionsView*
+  const OpenTelemetryPluginImpl::ActivePluginOptionsView*
       active_plugin_options_view_;
   absl::Span<const grpc_core::RefCountedStringValue> optional_labels_;
   bool is_client_;
-  const OpenTelemetryPlugin* otel_plugin_;
+  const OpenTelemetryPluginImpl* otel_plugin_;
 };
 
 }  // namespace internal

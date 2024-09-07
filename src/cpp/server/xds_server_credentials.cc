@@ -18,17 +18,18 @@
 
 #include <memory>
 
+#include "absl/log/check.h"
+
 #include <grpc/grpc.h>
 #include <grpc/grpc_security.h>
-#include <grpc/support/log.h>
 #include <grpcpp/security/server_credentials.h>
 
 namespace grpc {
 
 std::shared_ptr<ServerCredentials> XdsServerCredentials(
     const std::shared_ptr<ServerCredentials>& fallback_credentials) {
-  GPR_ASSERT(fallback_credentials != nullptr);
-  GPR_ASSERT(fallback_credentials->c_creds_ != nullptr);
+  CHECK_NE(fallback_credentials, nullptr);
+  CHECK_NE(fallback_credentials->c_creds_, nullptr);
   return std::shared_ptr<ServerCredentials>(new ServerCredentials(
       grpc_xds_server_credentials_create(fallback_credentials->c_creds_)));
 }

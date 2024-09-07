@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <grpc/support/port_platform.h>
-
 #include <algorithm>
 
 #include "absl/status/status.h"
+
+#include <grpc/support/port_platform.h>
 
 #include "src/core/lib/gprpp/status_helper.h"
 #include "src/core/lib/iomgr/port.h"  // IWYU pragma: keep
@@ -32,27 +32,26 @@
 #else
 #include <sys/socket.h>
 #include <sys/un.h>
-#endif // GPR_WINDOWS
+#endif  // GPR_WINDOWS
 
 #include <memory>
 #include <utility>
 
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/strip.h"
-
-#include <grpc/support/log.h>
 
 #include "src/core/lib/channel/channel_args.h"
 #include "src/core/lib/config/core_configuration.h"
 #include "src/core/lib/gprpp/orphanable.h"
 #include "src/core/lib/iomgr/error.h"
 #include "src/core/lib/iomgr/resolved_address.h"
+#include "src/core/lib/uri/uri_parser.h"
 #include "src/core/resolver/endpoint_addresses.h"
 #include "src/core/resolver/resolver.h"
 #include "src/core/resolver/resolver_factory.h"
-#include "src/core/lib/uri/uri_parser.h"
 
 namespace grpc_core {
 namespace {
@@ -126,12 +125,12 @@ class BinderResolverFactory final : public ResolverFactory {
     grpc_resolved_address addr;
     {
       if (!uri.authority().empty()) {
-        gpr_log(GPR_ERROR, "authority is not supported in binder scheme");
+        LOG(ERROR) << "authority is not supported in binder scheme";
         return false;
       }
       grpc_error_handle error = BinderAddrPopulate(uri.path(), &addr);
       if (!error.ok()) {
-        gpr_log(GPR_ERROR, "%s", StatusToString(error).c_str());
+        LOG(ERROR) << StatusToString(error);
         return false;
       }
     }

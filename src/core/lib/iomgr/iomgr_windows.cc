@@ -22,7 +22,7 @@
 
 #ifdef GRPC_WINSOCK_SOCKET
 
-#include <grpc/support/log.h>
+#include "absl/log/check.h"
 
 #include "src/core/lib/experiments/experiments.h"
 #include "src/core/lib/gprpp/crash.h"
@@ -51,12 +51,12 @@ extern grpc_pollset_set_vtable grpc_windows_pollset_set_vtable;
 static void winsock_init(void) {
   WSADATA wsaData;
   int status = WSAStartup(MAKEWORD(2, 0), &wsaData);
-  GPR_ASSERT(status == 0);
+  CHECK_EQ(status, 0);
 }
 
 static void winsock_shutdown(void) {
   int status = WSACleanup();
-  GPR_ASSERT(status == 0);
+  CHECK_EQ(status, 0);
 }
 
 static void iomgr_platform_init(void) {

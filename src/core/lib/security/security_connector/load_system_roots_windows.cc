@@ -30,11 +30,10 @@
 #include <grpc/slice.h>
 #include <grpc/slice_buffer.h>
 #include <grpc/support/alloc.h>
-#include <grpc/support/log.h>
 
-#include "src/core/lib/gpr/useful.h"
 #include "src/core/lib/security/security_connector/load_system_roots.h"
 #include "src/core/lib/slice/slice_internal.h"
+#include "src/core/util/useful.h"
 
 namespace grpc_core {
 namespace {

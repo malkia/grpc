@@ -65,8 +65,7 @@
 namespace grpc_core {
 namespace chaotic_good {
 
-class ChaoticGoodClientTransport final : public Transport,
-                                         public ClientTransport {
+class ChaoticGoodClientTransport final : public ClientTransport {
  public:
   ChaoticGoodClientTransport(
       PromiseEndpoint control_endpoint, PromiseEndpoint data_endpoint,
@@ -83,11 +82,7 @@ class ChaoticGoodClientTransport final : public Transport,
   void SetPollset(grpc_stream*, grpc_pollset*) override {}
   void SetPollsetSet(grpc_stream*, grpc_pollset_set*) override {}
   void PerformOp(grpc_transport_op*) override;
-  grpc_endpoint* GetEndpoint() override { return nullptr; }
-  void Orphan() override {
-    AbortWithError();
-    delete this;
-  }
+  void Orphan() override;
 
   void StartCall(CallHandler call_handler) override;
   void AbortWithError();
@@ -101,7 +96,7 @@ class ChaoticGoodClientTransport final : public Transport,
   uint32_t MakeStream(CallHandler call_handler);
   absl::optional<CallHandler> LookupStream(uint32_t stream_id);
   auto CallOutboundLoop(uint32_t stream_id, CallHandler call_handler);
-  auto OnTransportActivityDone();
+  auto OnTransportActivityDone(absl::string_view what);
   auto TransportWriteLoop(RefCountedPtr<ChaoticGoodTransport> transport);
   auto TransportReadLoop(RefCountedPtr<ChaoticGoodTransport> transport);
   // Push one frame into a call

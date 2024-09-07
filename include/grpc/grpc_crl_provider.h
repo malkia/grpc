@@ -25,6 +25,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 
+#include <grpc/credentials.h>
 #include <grpc/grpc_security.h>
 #include <grpc/support/port_platform.h>
 
@@ -81,7 +82,7 @@ absl::StatusOr<std::shared_ptr<CrlProvider>> CreateDirectoryReloaderCrlProvider(
 }  // namespace experimental
 }  // namespace grpc_core
 
-// TODO(gtcooke94) - Mark with api macro when all wrapped langauges support C++
+// TODO(gtcooke94) - Mark with api macro when all wrapped languages support C++
 // in core APIs
 /**
  * EXPERIMENTAL API - Subject to change

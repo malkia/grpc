@@ -23,7 +23,8 @@
 #include <cstdint>
 #include <utility>
 
-#include <grpc/support/log.h>
+#include "absl/log/check.h"
+
 #include <grpc/support/port_platform.h>
 
 #include "src/core/lib/gprpp/bitset.h"
@@ -100,7 +101,7 @@ Slice PercentEncodeSlice(Slice slice, PercentEncodingType type) {
       *q++ = hex[c & 15];
     }
   }
-  GPR_ASSERT(q == out.end());
+  CHECK(q == out.end());
   return Slice(std::move(out));
 }
 

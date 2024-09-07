@@ -237,7 +237,7 @@ def _try_extract_source_file_path(label: str) -> str:
         # labels in form //:src/core/lib/surface/call_test_only.h
         if label.startswith(":"):
             label = label[len(":") :]
-        # labels in form //test/core/util:port.cc
+        # labels in form //test/core/test_util:port.cc
         return label.replace(":", "/")
 
 
@@ -544,11 +544,11 @@ def update_test_metadata_with_transitive_metadata(
 
         bazel_rule = bazel_rules[_get_bazel_label(lib_name)]
 
-        if "//external:benchmark" in bazel_rule["_TRANSITIVE_DEPS"]:
+        if "//third_party:benchmark" in bazel_rule["_TRANSITIVE_DEPS"]:
             lib_dict["benchmark"] = True
             lib_dict["defaults"] = "benchmark"
 
-        if "//external:gtest" in bazel_rule["_TRANSITIVE_DEPS"]:
+        if "//third_party:gtest" in bazel_rule["_TRANSITIVE_DEPS"]:
             # run_tests.py checks the "gtest" property to see if test should be run via gtest.
             lib_dict["gtest"] = True
             # TODO: this might be incorrect categorization of the test...
@@ -672,7 +672,7 @@ def _patch_grpc_proto_library_rules(bazel_rules):
             and generator_func == "grpc_proto_library"
         ):
             # Add explicit protobuf dependency for internal c++ proto targets.
-            bazel_rule["deps"].append("//external:protobuf")
+            bazel_rule["deps"].append("//third_party:protobuf")
 
 
 def _patch_descriptor_upb_proto_library(bazel_rules):
@@ -828,7 +828,9 @@ def _exclude_unwanted_cc_tests(tests: List[str]) -> List[str]:
         test
         for test in tests
         if not test.startswith("test/cpp/ext/filters/census:")
-        and not test.startswith("test/core/xds:xds_channel_stack_modifier_test")
+        and not test.startswith(
+            "test/core/server:xds_channel_stack_modifier_test"
+        )
         and not test.startswith("test/cpp/ext/gcp:")
         and not test.startswith("test/cpp/ext/filters/logging:")
         and not test.startswith("test/cpp/interop:observability_interop")
@@ -1103,10 +1105,20 @@ _BUILD_EXTRA_METADATA = {
         "build": "all",
         "_RENAME": "upb_json_lib",
     },
+    "@com_google_protobuf//upb/mini_descriptor:mini_descriptor": {
+        "language": "c",
+        "build": "all",
+        "_RENAME": "upb_mini_descriptor_lib",
+    },
     "@com_google_protobuf//upb/text:text": {
         "language": "c",
         "build": "all",
         "_RENAME": "upb_textformat_lib",
+    },
+    "@com_google_protobuf//upb/wire:wire": {
+        "language": "c",
+        "build": "all",
+        "_RENAME": "upb_wire_lib",
     },
     "@com_google_protobuf//third_party/utf8_range:utf8_range": {
         "language": "c",
@@ -1219,12 +1231,12 @@ _BUILD_EXTRA_METADATA = {
     },
     # TODO(jtattermusch): consider adding grpc++_core_stats
     # test support libraries
-    "test/core/util:grpc_test_util": {
+    "test/core/test_util:grpc_test_util": {
         "language": "c",
         "build": "private",
         "_RENAME": "grpc_test_util",
     },
-    "test/core/util:grpc_test_util_unsecure": {
+    "test/core/test_util:grpc_test_util_unsecure": {
         "language": "c",
         "build": "private",
         "_RENAME": "grpc_test_util_unsecure",
@@ -1331,8 +1343,8 @@ _BAZEL_DEPS_QUERIES = [
     'deps("//test/...")',
     'deps("//:all")',
     'deps("//src/compiler/...")',
-    # allow resolving bind() workspace rules to the actual targets they point to
-    'kind(bind, "//external:*")',
+    # allow resolving alias() targets to the actual targets they point to
+    'kind(alias, "//third_party:*")',
     # The ^ is needed to differentiate proto_library from go_proto_library
     'deps(kind("^proto_library", @envoy_api//envoy/...))',
     # Make sure we have source info for all the targets that _expand_upb_proto_library_rules artificially adds

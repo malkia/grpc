@@ -30,7 +30,7 @@
 #include <grpc/support/port_platform.h>
 
 #include "src/core/lib/event_engine/default_event_engine.h"
-#include "test/core/util/test_config.h"
+#include "test/core/test_util/test_config.h"
 
 namespace {
 
@@ -69,7 +69,7 @@ class DefaultEngineTest : public testing::Test {
         const DNSResolver::ResolverOptions& /* options */) override {
       return nullptr;
     };
-    void Run(Closure* /* closure */) override{};
+    void Run(Closure* /* closure */) override {};
     void Run(absl::AnyInvocable<void()> /* closure */) override{};
     TaskHandle RunAfter(Duration /* when */, Closure* /* closure */) override {
       return {-1, -1};

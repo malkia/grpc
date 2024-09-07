@@ -19,6 +19,7 @@
 #include <string>
 #include <utility>
 
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 
@@ -26,7 +27,6 @@
 #include <grpc/event_engine/event_engine.h>
 #include <grpc/event_engine/memory_allocator.h>
 #include <grpc/grpc.h>
-#include <grpc/support/log.h>
 #include <grpc/support/port_platform.h>
 
 #include "src/core/lib/gprpp/ref_counted_ptr.h"
@@ -161,9 +161,9 @@ void UnlinkIfUnixDomainSocket(
 
 class PosixSocketWrapper {
  public:
-  explicit PosixSocketWrapper(int fd) : fd_(fd) { GPR_ASSERT(fd_ > 0); }
+  explicit PosixSocketWrapper(int fd) : fd_(fd) { CHECK_GT(fd_, 0); }
 
-  PosixSocketWrapper() : fd_(-1){};
+  PosixSocketWrapper() : fd_(-1) {};
 
   ~PosixSocketWrapper() = default;
 
@@ -321,6 +321,8 @@ struct PosixSocketWrapper::PosixSocketCreateResult {
   PosixSocketWrapper sock;
   EventEngine::ResolvedAddress mapped_target_addr;
 };
+
+bool SetSocketDualStack(int fd);
 
 }  // namespace experimental
 }  // namespace grpc_event_engine
